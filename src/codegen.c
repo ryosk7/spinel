@@ -3680,6 +3680,63 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
             return xstrdup("0");
         }
 
+        /* catch(:tag) { block } → setjmp + block, return value or thrown value */
+        if (!call->receiver && strcmp(method, "catch") == 0 &&
+            call->arguments && call->arguments->arguments.size >= 1 &&
+            call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE) {
+            char *tag = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            int tmp = ctx->temp_counter++;
+            vtype_t rt = infer_type(ctx, (pm_node_t *)blk->body);
+            char *ct = (rt.kind == SPINEL_TYPE_STRING) ? xstrdup("const char *") : xstrdup("mrb_int");
+            emit(ctx, "%s _catch_%d; {\n", ct, tmp);
+            ctx->indent++;
+            emit(ctx, "sp_exc_depth++;\n");
+            emit(ctx, "int _cj_%d = setjmp(sp_exc_stack[sp_exc_depth - 1]);\n", tmp);
+            emit(ctx, "if (_cj_%d == 0) {\n", tmp);
+            ctx->indent++;
+            /* Block body — last expression is the return value */
+            if (blk->body && PM_NODE_TYPE(blk->body) == PM_STATEMENTS_NODE) {
+                pm_statements_node_t *stmts = (pm_statements_node_t *)blk->body;
+                for (size_t si = 0; si + 1 < stmts->body.size; si++)
+                    codegen_stmt(ctx, stmts->body.nodes[si]);
+                if (stmts->body.size > 0) {
+                    char *val = codegen_expr(ctx, stmts->body.nodes[stmts->body.size - 1]);
+                    emit(ctx, "_catch_%d = %s;\n", tmp, val);
+                    free(val);
+                }
+            }
+            emit(ctx, "sp_exc_depth--;\n");
+            ctx->indent--;
+            emit(ctx, "} else if (_cj_%d == 2 && sp_throw_tag && strcmp(sp_throw_tag, %s) == 0) {\n", tmp, tag);
+            ctx->indent++;
+            emit(ctx, "sp_exc_depth--;\n");
+            if (rt.kind == SPINEL_TYPE_STRING)
+                emit(ctx, "_catch_%d = sp_throw_is_str ? sp_throw_value_s : \"\";\n", tmp);
+            else
+                emit(ctx, "_catch_%d = sp_throw_is_str ? 0 : sp_throw_value_i;\n", tmp);
+            emit(ctx, "sp_throw_tag = NULL;\n");
+            ctx->indent--;
+            emit(ctx, "} else {\n");
+            ctx->indent++;
+            emit(ctx, "sp_exc_depth--;\n");
+            emit(ctx, "if (sp_exc_depth > 0) longjmp(sp_exc_stack[sp_exc_depth - 1], _cj_%d);\n", tmp);
+            ctx->indent--;
+            emit(ctx, "}\n");
+            ctx->indent--;
+            emit(ctx, "}\n");
+            free(tag); free(ct); free(method);
+            return sfmt("_catch_%d", tmp);
+        }
+
+        /* throw in expression context → emit as statement, return 0 */
+        if (!call->receiver && strcmp(method, "throw") == 0 &&
+            call->arguments && call->arguments->arguments.size >= 1) {
+            codegen_stmt(ctx, node); /* emit the throw */
+            free(method);
+            return xstrdup("0 /* throw */");
+        }
+
         /* block_given? → check if _block is non-NULL */
         if (!call->receiver && strcmp(method, "block_given?") == 0) {
             free(method);
@@ -4688,6 +4745,28 @@ static void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                 emit(ctx, "sp_raise(\"RuntimeError\");\n");
             }
             free(method);
+            break;
+        }
+
+        /* throw :tag, value */
+        if (!call->receiver && strcmp(method, "throw") == 0 &&
+            call->arguments && call->arguments->arguments.size >= 1) {
+            pm_node_t *tag_node = call->arguments->arguments.nodes[0];
+            char *tag = codegen_expr(ctx, tag_node);
+            int argc = (int)call->arguments->arguments.size;
+            if (argc >= 2) {
+                pm_node_t *val_node = call->arguments->arguments.nodes[1];
+                vtype_t vt = infer_type(ctx, val_node);
+                char *val = codegen_expr(ctx, val_node);
+                if (vt.kind == SPINEL_TYPE_STRING)
+                    emit(ctx, "sp_throw_s(%s, %s);\n", tag, val);
+                else
+                    emit(ctx, "sp_throw_i(%s, %s);\n", tag, val);
+                free(val);
+            } else {
+                emit(ctx, "sp_throw_i(%s, 0);\n", tag);
+            }
+            free(tag); free(method);
             break;
         }
 
@@ -6180,6 +6259,21 @@ static void emit_header(codegen_ctx_t *ctx) {
         emit_raw(ctx, "    if (strcmp(cls, \"RuntimeError\") == 0) return 1;\n");
         emit_raw(ctx, "    return 0;\n");
         emit_raw(ctx, "}\n\n");
+        /* catch/throw support */
+        emit_raw(ctx, "static const char *sp_throw_tag = NULL;\n");
+        emit_raw(ctx, "static mrb_int sp_throw_value_i = 0;\n");
+        emit_raw(ctx, "static const char *sp_throw_value_s = NULL;\n");
+        emit_raw(ctx, "static int sp_throw_is_str = 0;\n");
+        emit_raw(ctx, "static void sp_throw_i(const char *tag, mrb_int val) {\n");
+        emit_raw(ctx, "    sp_throw_tag = tag; sp_throw_value_i = val; sp_throw_is_str = 0;\n");
+        emit_raw(ctx, "    if (sp_exc_depth > 0) longjmp(sp_exc_stack[sp_exc_depth - 1], 2);\n");
+        emit_raw(ctx, "    fprintf(stderr, \"uncaught throw :\\\"%%s\\\"\\n\", tag); exit(1);\n");
+        emit_raw(ctx, "}\n");
+        emit_raw(ctx, "static void sp_throw_s(const char *tag, const char *val) {\n");
+        emit_raw(ctx, "    sp_throw_tag = tag; sp_throw_value_s = val; sp_throw_is_str = 1;\n");
+        emit_raw(ctx, "    if (sp_exc_depth > 0) longjmp(sp_exc_stack[sp_exc_depth - 1], 2);\n");
+        emit_raw(ctx, "    fprintf(stderr, \"uncaught throw :\\\"%%s\\\"\\n\", tag); exit(1);\n");
+        emit_raw(ctx, "}\n\n");
     }
 
     /* Built-in sp_IntArray for Array support */
@@ -6617,8 +6711,9 @@ static bool has_exception_nodes(codegen_ctx_t *ctx, pm_node_t *node) {
     }
     case PM_CALL_NODE: {
         pm_call_node_t *c = (pm_call_node_t *)node;
-        /* Check if this is a raise call */
-        if (!c->receiver && ceq(ctx, c->name, "raise")) return true;
+        /* Check if this is a raise/throw/catch call */
+        if (!c->receiver && (ceq(ctx, c->name, "raise") ||
+            ceq(ctx, c->name, "throw") || ceq(ctx, c->name, "catch"))) return true;
         if (c->receiver && has_exception_nodes(ctx, c->receiver)) return true;
         if (c->arguments) {
             for (size_t i = 0; i < c->arguments->arguments.size; i++)
