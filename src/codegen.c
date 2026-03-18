@@ -1175,8 +1175,10 @@ static vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
                  strcmp(method, "printf") == 0 || strcmp(method, "putc") == 0 ||
                  strcmp(method, "p") == 0)
             result = vt_prim(SPINEL_TYPE_NIL);
-        else if (strcmp(method, "block_given?") == 0)
+        else if (strcmp(method, "block_given?") == 0 || strcmp(method, "frozen?") == 0)
             result = vt_prim(SPINEL_TYPE_BOOLEAN);
+        else if (strcmp(method, "__method__") == 0)
+            result = vt_prim(SPINEL_TYPE_STRING);
 
         free(method);
         return result;
@@ -3478,6 +3480,18 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                 free(recv);
             }
 
+            /* freeze → no-op (return self expression), frozen? → TRUE */
+            if (strcmp(method, "freeze") == 0) {
+                char *recv = codegen_expr(ctx, call->receiver);
+                free(method);
+                return recv; /* freeze returns self, no-op in AOT */
+            }
+            if (strcmp(method, "frozen?") == 0) {
+                codegen_expr(ctx, call->receiver); /* evaluate receiver for side effects */
+                free(method);
+                return xstrdup("TRUE"); /* everything is effectively frozen in AOT */
+            }
+
             /* Universal methods: nil?, is_a?, respond_to? */
             if (strcmp(method, "nil?") == 0) {
                 /* nil? is always false for non-nil values, true for nil */
@@ -3741,6 +3755,16 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
         if (!call->receiver && strcmp(method, "block_given?") == 0) {
             free(method);
             return xstrdup("(_block != NULL)");
+        }
+
+        /* __method__ → current method/function name as symbol string */
+        if (!call->receiver && strcmp(method, "__method__") == 0) {
+            free(method);
+            if (ctx->current_method)
+                return sfmt("\"%s\"", ctx->current_method->name);
+            if (ctx->current_func_name[0])
+                return sfmt("\"%s\"", ctx->current_func_name);
+            return xstrdup("\"main\"");
         }
 
         /* Receiver-less: top-level function or Kernel method */
@@ -5565,6 +5589,7 @@ static void emit_method(codegen_ctx_t *ctx, class_info_t *cls, method_info_t *m)
 /* ------------------------------------------------------------------ */
 
 static void emit_top_func(codegen_ctx_t *ctx, func_info_t *f) {
+    snprintf(ctx->current_func_name, sizeof(ctx->current_func_name), "%s", f->name);
     /* Determine return type */
     char *ret_ct = vt_ctype(ctx, f->return_type, false);
     bool ret_void = (f->return_type.kind == SPINEL_TYPE_NIL);
@@ -5784,6 +5809,7 @@ static void emit_top_func(codegen_ctx_t *ctx, func_info_t *f) {
     ctx->gc_scope_active = saved_gc_scope;
     ctx->indent = saved_indent;
     ctx->var_count = saved_var_count;
+    ctx->current_func_name[0] = '\0';
 
     emit_raw(ctx, "}\n\n");
     free(ret_ct);

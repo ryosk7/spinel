@@ -158,6 +158,7 @@ typedef struct {
     class_info_t *current_class;
     method_info_t *current_method;
     module_info_t *current_module;
+    char current_func_name[64]; /* for __method__ in top-level functions */
 
     /* When true, the last expression in a block should be emitted as a return */
     bool implicit_return;
