@@ -745,6 +745,73 @@ static void class_analysis_pass(codegen_ctx_t *ctx, pm_node_t *root) {
         case PM_DEF_NODE:
             analyze_top_func(ctx, (pm_def_node_t *)s);
             break;
+        case PM_CONSTANT_WRITE_NODE: {
+            /* Detect Struct.new(:x, :y) → synthetic class */
+            pm_constant_write_node_t *cw = (pm_constant_write_node_t *)s;
+            if (PM_NODE_TYPE(cw->value) == PM_CALL_NODE) {
+                pm_call_node_t *call = (pm_call_node_t *)cw->value;
+                if (call->receiver && PM_NODE_TYPE(call->receiver) == PM_CONSTANT_READ_NODE) {
+                    pm_constant_read_node_t *cr = (pm_constant_read_node_t *)call->receiver;
+                    if (ceq(ctx, cr->name, "Struct") && ceq(ctx, call->name, "new") &&
+                        call->arguments) {
+                        /* Create synthetic class */
+                        class_info_t *cls = &ctx->classes[ctx->class_count++];
+                        memset(cls, 0, sizeof(*cls));
+                        char *name = cstr(ctx, cw->name);
+                        snprintf(cls->name, sizeof(cls->name), "%s", name);
+                        cls->is_value_type = false;
+                        cls->class_node = (pm_node_t *)s;
+
+                        /* Each symbol arg becomes an ivar + getter + setter */
+                        int nfields = (int)call->arguments->arguments.size;
+                        method_info_t *init = &cls->methods[cls->method_count++];
+                        memset(init, 0, sizeof(*init));
+                        snprintf(init->name, sizeof(init->name), "initialize");
+                        init->return_type = vt_obj(name);
+
+                        for (int fi = 0; fi < nfields && fi < MAX_IVARS; fi++) {
+                            pm_node_t *arg = call->arguments->arguments.nodes[fi];
+                            if (PM_NODE_TYPE(arg) != PM_SYMBOL_NODE) continue;
+                            pm_symbol_node_t *sym = (pm_symbol_node_t *)arg;
+                            const uint8_t *fsrc = pm_string_source(&sym->unescaped);
+                            size_t flen = pm_string_length(&sym->unescaped);
+                            char fname[64];
+                            snprintf(fname, sizeof(fname), "%.*s", (int)flen, fsrc);
+
+                            /* Ivar */
+                            ivar_info_t *iv = &cls->ivars[cls->ivar_count++];
+                            snprintf(iv->name, sizeof(iv->name), "%s", fname);
+                            iv->type = vt_prim(SPINEL_TYPE_INTEGER);
+
+                            /* Init param */
+                            snprintf(init->params[init->param_count].name, 64, "%s", fname);
+                            init->params[init->param_count].type = vt_prim(SPINEL_TYPE_INTEGER);
+                            init->param_count++;
+
+                            /* Getter */
+                            method_info_t *getter = &cls->methods[cls->method_count++];
+                            memset(getter, 0, sizeof(*getter));
+                            snprintf(getter->name, sizeof(getter->name), "%s", fname);
+                            getter->is_getter = true;
+                            snprintf(getter->accessor_ivar, sizeof(getter->accessor_ivar), "%s", fname);
+                            getter->return_type = vt_prim(SPINEL_TYPE_INTEGER);
+
+                            /* Setter */
+                            method_info_t *setter = &cls->methods[cls->method_count++];
+                            memset(setter, 0, sizeof(*setter));
+                            snprintf(setter->name, sizeof(setter->name), "%s=", fname);
+                            setter->is_setter = true;
+                            snprintf(setter->accessor_ivar, sizeof(setter->accessor_ivar), "%s", fname);
+                            setter->param_count = 1;
+                            snprintf(setter->params[0].name, 64, "v");
+                            setter->params[0].type = vt_prim(SPINEL_TYPE_INTEGER);
+                        }
+                        free(name);
+                    }
+                }
+            }
+            break;
+        }
         default:
             break;
         }
@@ -2345,9 +2412,17 @@ static void emit_constructor(codegen_ctx_t *ctx, class_info_t *cls) {
                  cls->name, cls->name, cls->name);
     }
 
-    /* Initialize fields from initialize body */
+    /* Initialize fields from initialize body (or synthetically for Struct) */
     ctx->current_class = cls;
-    if (init->body_node && PM_NODE_TYPE(init->body_node) == PM_STATEMENTS_NODE) {
+    if (!init->body_node) {
+        /* Synthetic constructor (e.g., Struct.new) — assign params to fields */
+        for (int fi = 0; fi < init->param_count && fi < cls->ivar_count; fi++) {
+            if (cls->is_value_type)
+                emit_raw(ctx, "    self.%s = lv_%s;\n", cls->ivars[fi].name, init->params[fi].name);
+            else
+                emit_raw(ctx, "    self->%s = lv_%s;\n", cls->ivars[fi].name, init->params[fi].name);
+        }
+    } else if (PM_NODE_TYPE(init->body_node) == PM_STATEMENTS_NODE) {
         pm_statements_node_t *stmts = (pm_statements_node_t *)init->body_node;
         for (size_t i = 0; i < stmts->body.size; i++) {
             pm_node_t *s = stmts->body.nodes[i];
