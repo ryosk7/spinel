@@ -10,7 +10,7 @@ Regexp対応プログラムのみ libonig をリンク。
 
 ## 現状 (Status)
 
-### コンパイラアーキテクチャ (~9700行のC)
+### コンパイラアーキテクチャ (~10500行のC)
 
 - Prism (libprism) によるRubyパース
 - 多パスコード生成:
@@ -94,7 +94,7 @@ Regexp対応プログラムのみ libonig をリンク。
 | | シャドウスタックルート管理, ファイナライザ |
 | | GC不要なプログラムではGCコード省略 |
 
-### テストプログラム (40例)
+### テストプログラム (47例)
 
 | プログラム | テスト対象 |
 |-----------|-----------|
@@ -219,7 +219,7 @@ typedef struct {
     };
 } sp_RbValue;  // 16 bytes
 
-// Phase 2 (将来): NaN-boxing (8バイト、高速)
+// NaN-boxing 完了: 8バイト、favor pointer (JSC方式)
 ```
 
 ### 3段階メソッドディスパッチ
@@ -365,7 +365,7 @@ sp_RbValue sp_dispatch_puts(sp_RbValue v) {
 | **5** | sp_String (ミュータブル文字列 + GC) | ✅ 完了 |
 | **5b** | sp_String Phase 2-4 (replace, clear, [], gsub等) | ✅ 完了 |
 | **6** | require_relative (複数ファイルコンパイル) | ✅ 完了 |
-| **7** | NaN-boxing (8バイト化) | **次** |
+| **7** | NaN-boxing (8バイト化, favor pointer) | ✅ 完了 |
 
 ### 設計原則
 
@@ -501,8 +501,8 @@ spinel/
 ├── src/
 │   ├── main.c          # CLI、ファイル読み込み、Prismパース
 │   ├── codegen.h       # 型システム、クラス/メソッド/モジュール情報構造体
-│   └── codegen.c       # 多パスコード生成器 (~9700行)
-├── examples/           # 40テストプログラム
+│   └── codegen.c       # 多パスコード生成器 (~10500行)
+├── examples/           # 47テストプログラム
 ├── prototype/
 │   └── tools/          # Step 0プロトタイプ (RBS抽出、LumiTrace等)
 ├── Makefile
