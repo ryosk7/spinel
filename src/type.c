@@ -428,7 +428,7 @@ vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
                 if (strcmp(method, "join") == 0) { free(method); return vt_prim(SPINEL_TYPE_STRING); }
                 if (strcmp(method, "any?") == 0) { free(method); return vt_prim(SPINEL_TYPE_BOOLEAN); }
                 if (strcmp(method, "find") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
-                if (strcmp(method, "filter_map") == 0) { free(method); return vt_prim(SPINEL_TYPE_ARRAY); }
+                if (strcmp(method, "filter_map") == 0 || strcmp(method, "flat_map") == 0) { free(method); return vt_prim(SPINEL_TYPE_ARRAY); }
                 if (strcmp(method, "count") == 0 || strcmp(method, "min_by") == 0 ||
                     strcmp(method, "max_by") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
                 if (strcmp(method, "sort_by") == 0) { free(method); return vt_prim(SPINEL_TYPE_ARRAY); }

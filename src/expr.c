@@ -1365,6 +1365,40 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                     free(bpname);
                     r = sfmt("_fm_%d", tmp);
                 }
+                else if (strcmp(method, "flat_map") == 0 && call->block &&
+                         PM_NODE_TYPE(call->block) == PM_BLOCK_NODE) {
+                    /* flat_map: block returns IntArray, flatten into single IntArray */
+                    pm_block_node_t *blk = (pm_block_node_t *)call->block;
+                    char *bpname = extract_block_param(ctx, blk);
+                    int tmp = ctx->temp_counter++;
+                    emit(ctx, "sp_IntArray *_flatm_%d = sp_IntArray_new();\n", tmp);
+                    emit(ctx, "for (mrb_int _fi_%d = 0; _fi_%d < sp_IntArray_length(%s); _fi_%d++) {\n", tmp, tmp, recv, tmp);
+                    ctx->indent++;
+                    if (bpname) {
+                        char *cn = make_cname(bpname, false);
+                        emit(ctx, "mrb_int %s = sp_IntArray_get(%s, _fi_%d);\n", cn, recv, tmp);
+                        free(cn);
+                    }
+                    if (blk->body) {
+                        pm_statements_node_t *stmts = (pm_statements_node_t *)blk->body;
+                        if (stmts->body.size > 0) {
+                            char *val = codegen_expr(ctx, stmts->body.nodes[stmts->body.size - 1]);
+                            /* Append all elements from the inner array */
+                            int inner = ctx->temp_counter++;
+                            emit(ctx, "{ sp_IntArray *_inner_%d = %s;\n", inner, val);
+                            emit(ctx, "  for (mrb_int _j_%d = 0; _j_%d < sp_IntArray_length(_inner_%d); _j_%d++)\n",
+                                 inner, inner, inner, inner);
+                            emit(ctx, "    sp_IntArray_push(_flatm_%d, sp_IntArray_get(_inner_%d, _j_%d));\n",
+                                 tmp, inner, inner);
+                            emit(ctx, "}\n");
+                            free(val);
+                        }
+                    }
+                    ctx->indent--;
+                    emit(ctx, "}\n");
+                    free(bpname);
+                    r = sfmt("_flatm_%d", tmp);
+                }
                 if (r) {
                     free(recv); free(method);
                     return r;
