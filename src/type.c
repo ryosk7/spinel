@@ -879,11 +879,23 @@ vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
         return vt_prim(SPINEL_TYPE_NIL);
     }
 
-    case PM_ARRAY_NODE:
-        /* Array literals are sp_RbArray (heterogeneous) unless in lambda mode */
+    case PM_ARRAY_NODE: {
+        /* Array literals: if all elements are integer, use IntArray; otherwise RbArray */
         if (ctx->lambda_mode)
             return vt_prim(SPINEL_TYPE_ARRAY);
+        pm_array_node_t *ary_node = (pm_array_node_t *)node;
+        if (ary_node->elements.size == 0)
+            return vt_prim(SPINEL_TYPE_ARRAY); /* empty [] → IntArray */
+        bool all_int = true, all_str = true;
+        for (size_t i = 0; i < ary_node->elements.size; i++) {
+            vtype_t et = infer_type(ctx, ary_node->elements.nodes[i]);
+            if (et.kind != SPINEL_TYPE_INTEGER) all_int = false;
+            if (et.kind != SPINEL_TYPE_STRING) all_str = false;
+        }
+        if (all_int) return vt_prim(SPINEL_TYPE_ARRAY);
+        if (all_str) return vt_prim(SPINEL_TYPE_STR_ARRAY);
         return vt_prim(SPINEL_TYPE_RB_ARRAY);
+    }
 
     case PM_HASH_NODE: {
         /* Detect heterogeneous hash: if values have different types, use sp_RbHash */

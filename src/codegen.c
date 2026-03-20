@@ -1240,6 +1240,21 @@ static bool has_split_calls(codegen_ctx_t *ctx, pm_node_t *node) {
         pm_block_node_t *b = (pm_block_node_t *)node;
         return b->body ? has_split_calls(ctx, (pm_node_t *)b->body) : false;
     }
+    case PM_ARRAY_NODE: {
+        /* String array literal ["a", "b"] needs sp_StrArray */
+        pm_array_node_t *ary = (pm_array_node_t *)node;
+        if (ary->elements.size > 0) {
+            bool all_str = true;
+            for (size_t i = 0; i < ary->elements.size; i++) {
+                if (PM_NODE_TYPE(ary->elements.nodes[i]) != PM_STRING_NODE &&
+                    PM_NODE_TYPE(ary->elements.nodes[i]) != PM_INTERPOLATED_STRING_NODE) {
+                    all_str = false; break;
+                }
+            }
+            if (all_str) return true;
+        }
+        return false;
+    }
     default:
         return false;
     }

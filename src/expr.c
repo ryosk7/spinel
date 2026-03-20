@@ -792,7 +792,8 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                 return r;
             }
             if (recv_t.kind != SPINEL_TYPE_ARRAY && recv_t.kind != SPINEL_TYPE_HASH &&
-                recv_t.kind != SPINEL_TYPE_RB_HASH) {
+                recv_t.kind != SPINEL_TYPE_RB_HASH && recv_t.kind != SPINEL_TYPE_STR_ARRAY &&
+                recv_t.kind != SPINEL_TYPE_RB_ARRAY) {
                 char *recv = codegen_expr(ctx, call->receiver);
                 char *idx = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
                 char *r = sfmt("%s[%s]", recv, idx);
@@ -3554,6 +3555,33 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                 return xstrdup("sp_ValArray_new()");
             }
         }
+        vtype_t ary_type = infer_type(ctx, node);
+
+        /* Homogeneous integer array [1, 2, 3] → sp_IntArray */
+        if (ary_type.kind == SPINEL_TYPE_ARRAY) {
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "sp_IntArray *_ary_%d = sp_IntArray_new();\n", tmp);
+            for (size_t i = 0; i < ary->elements.size; i++) {
+                char *val = codegen_expr(ctx, ary->elements.nodes[i]);
+                emit(ctx, "sp_IntArray_push(_ary_%d, %s);\n", tmp, val);
+                free(val);
+            }
+            return sfmt("_ary_%d", tmp);
+        }
+
+        /* Homogeneous string array ["a", "b"] → sp_StrArray */
+        if (ary_type.kind == SPINEL_TYPE_STR_ARRAY) {
+            ctx->needs_str_split = true; /* ensures sp_StrArray is emitted */
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "sp_StrArray *_ary_%d = sp_StrArray_new();\n", tmp);
+            for (size_t i = 0; i < ary->elements.size; i++) {
+                char *val = codegen_expr(ctx, ary->elements.nodes[i]);
+                emit(ctx, "sp_StrArray_push(_ary_%d, %s);\n", tmp, val);
+                free(val);
+            }
+            return sfmt("_ary_%d", tmp);
+        }
+
         /* sp_RbArray for array literals (heterogeneous) */
         {
             ctx->needs_rb_array = true;
