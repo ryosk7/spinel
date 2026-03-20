@@ -178,6 +178,7 @@ const char *spinel_type_cname(spinel_type_t k) {
     case SPINEL_TYPE_RB_ARRAY: return "sp_RbArray *";
     case SPINEL_TYPE_RB_HASH:  return "sp_RbHash *";
     case SPINEL_TYPE_SP_STRING: return "sp_String *";
+    case SPINEL_TYPE_FILE:     return "sp_File *";
     default:                  return "mrb_int"; /* fallback for standalone mode */
     }
 }
@@ -1215,6 +1216,15 @@ static vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
             }
         }
 
+        /* File.open → SPINEL_TYPE_FILE */
+        if (call->receiver && PM_NODE_TYPE(call->receiver) == PM_CONSTANT_READ_NODE) {
+            pm_constant_read_node_t *cr = (pm_constant_read_node_t *)call->receiver;
+            if (ceq(ctx, cr->name, "File") && strcmp(method, "open") == 0) {
+                free(method);
+                return vt_prim(SPINEL_TYPE_FILE);
+            }
+        }
+
         /* Constructor: ClassName.new(...) — check early before binary ops */
         if (strcmp(method, "new") == 0 && call->receiver &&
             PM_NODE_TYPE(call->receiver) == PM_CONSTANT_READ_NODE) {
@@ -1382,6 +1392,17 @@ static vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
                 if (strcmp(method, "gsub") == 0 || strcmp(method, "sub") == 0) { free(method); return vt_prim(SPINEL_TYPE_STRING); }
                 if (strcmp(method, "split") == 0) { free(method); return vt_prim(SPINEL_TYPE_STR_ARRAY); }
                 if (strcmp(method, "+") == 0) { free(method); return vt_prim(SPINEL_TYPE_STRING); }
+            }
+            /* File instance methods on FILE-typed receiver */
+            if (recv_t.kind == SPINEL_TYPE_FILE) {
+                if (strcmp(method, "puts") == 0 || strcmp(method, "write") == 0 ||
+                    strcmp(method, "each_line") == 0 || strcmp(method, "close") == 0 ||
+                    strcmp(method, "flock") == 0 || strcmp(method, "seek") == 0) {
+                    free(method); return vt_prim(SPINEL_TYPE_NIL);
+                }
+                if (strcmp(method, "readline") == 0 || strcmp(method, "read") == 0) {
+                    free(method); return vt_prim(SPINEL_TYPE_STRING);
+                }
             }
             /* Time methods on TIME-typed receiver */
             if (recv_t.kind == SPINEL_TYPE_TIME) {
@@ -2043,6 +2064,20 @@ static void infer_pass(codegen_ctx_t *ctx, pm_node_t *node) {
                             char *meth = cstr(ctx, call->name);
                             if (strcmp(meth, "scan") == 0)
                                 bp_type = SPINEL_TYPE_STRING;
+                            /* File.open block param → FILE type */
+                            if (strcmp(meth, "open") == 0 && call->receiver &&
+                                PM_NODE_TYPE(call->receiver) == PM_CONSTANT_READ_NODE) {
+                                pm_constant_read_node_t *cr = (pm_constant_read_node_t *)call->receiver;
+                                if (ceq(ctx, cr->name, "File"))
+                                    bp_type = SPINEL_TYPE_FILE;
+                            }
+                            /* each_line on FILE-typed receiver → STRING block param */
+                            if (strcmp(meth, "each_line") == 0 && call->receiver) {
+                                vtype_t recv_t = infer_type(ctx, call->receiver);
+                                if (recv_t.kind == SPINEL_TYPE_FILE ||
+                                    recv_t.kind == SPINEL_TYPE_STRING)
+                                    bp_type = SPINEL_TYPE_STRING;
+                            }
                             free(meth);
                         }
                         pm_node_t *p = bp->parameters->requireds.nodes[0];
@@ -4697,6 +4732,32 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                 free(recv);
             }
 
+            /* sp_File instance method calls */
+            if (recv_t.kind == SPINEL_TYPE_FILE) {
+                char *recv = codegen_expr(ctx, call->receiver);
+                char *r = NULL;
+                if (strcmp(method, "readline") == 0)
+                    r = sfmt("sp_File_readline(%s)", recv);
+                else if (strcmp(method, "read") == 0)
+                    r = sfmt("sp_File_read_all(%s)", recv);
+                else if (strcmp(method, "puts") == 0 && call->arguments &&
+                         call->arguments->arguments.size > 0) {
+                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    r = sfmt("(sp_File_puts(%s, %s), (mrb_int)0)", recv, arg);
+                    free(arg);
+                } else if (strcmp(method, "write") == 0 && call->arguments &&
+                           call->arguments->arguments.size > 0) {
+                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    r = sfmt("(sp_File_write_str(%s, %s), (mrb_int)0)", recv, arg);
+                    free(arg);
+                }
+                if (r) {
+                    free(recv); free(method);
+                    return r;
+                }
+                free(recv);
+            }
+
             /* sp_Range method calls */
             if (recv_t.kind == SPINEL_TYPE_RANGE) {
                 char *recv = codegen_expr(ctx, call->receiver);
@@ -7202,6 +7263,132 @@ static void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
             }
         }
 
+        /* File.open(path, mode) do |f| ... end → sp_File open/close block */
+        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+            strcmp(method, "open") == 0 && call->receiver &&
+            PM_NODE_TYPE(call->receiver) == PM_CONSTANT_READ_NODE) {
+            pm_constant_read_node_t *cr = (pm_constant_read_node_t *)call->receiver;
+            if (ceq(ctx, cr->name, "File") && call->arguments &&
+                call->arguments->arguments.size >= 1) {
+                ctx->needs_file_io = true;
+                pm_block_node_t *blk = (pm_block_node_t *)call->block;
+                char *path_arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                char *mode_arg = NULL;
+                if (call->arguments->arguments.size >= 2)
+                    mode_arg = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
+                else
+                    mode_arg = xstrdup("\"r\"");
+                /* Get block parameter name */
+                char *bpname = NULL;
+                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
+                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
+                    if (bp->parameters && bp->parameters->requireds.size > 0) {
+                        pm_node_t *p = bp->parameters->requireds.nodes[0];
+                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+                    }
+                }
+                char *cn = bpname ? make_cname(bpname, false) : xstrdup("_fio");
+                emit(ctx, "{\n");
+                ctx->indent++;
+                emit(ctx, "sp_File *%s = sp_File_open(%s, %s);\n", cn, path_arg, mode_arg);
+                /* Register block param as FILE type */
+                if (bpname)
+                    var_declare(ctx, bpname, vt_prim(SPINEL_TYPE_FILE), false);
+                if (blk->body) {
+                    bool saved_ir = ctx->implicit_return;
+                    ctx->implicit_return = false;
+                    codegen_stmts(ctx, (pm_node_t *)blk->body);
+                    ctx->implicit_return = saved_ir;
+                }
+                emit(ctx, "sp_File_close(%s);\n", cn);
+                ctx->indent--;
+                emit(ctx, "}\n");
+                free(path_arg); free(mode_arg); free(bpname); free(cn); free(method);
+                break;
+            }
+        }
+
+        /* f.each_line do |line| ... end on FILE-typed receiver */
+        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+            strcmp(method, "each_line") == 0 && call->receiver) {
+            vtype_t recv_t = infer_type(ctx, call->receiver);
+            if (recv_t.kind == SPINEL_TYPE_FILE) {
+                pm_block_node_t *blk = (pm_block_node_t *)call->block;
+                char *recv = codegen_expr(ctx, call->receiver);
+                char *bpname = NULL;
+                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
+                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
+                    if (bp->parameters && bp->parameters->requireds.size > 0) {
+                        pm_node_t *p = bp->parameters->requireds.nodes[0];
+                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+                    }
+                }
+                int tmp = ctx->temp_counter++;
+                emit(ctx, "{ char _buf_%d[4096];\n", tmp);
+                emit(ctx, "while (fgets(_buf_%d, sizeof(_buf_%d), %s->fp)) {\n", tmp, tmp, recv);
+                ctx->indent++;
+                emit(ctx, "size_t _len_%d = strlen(_buf_%d);\n", tmp, tmp);
+                emit(ctx, "if (_len_%d > 0 && _buf_%d[_len_%d-1] == '\\n') _buf_%d[_len_%d-1] = '\\0';\n",
+                     tmp, tmp, tmp, tmp, tmp);
+                if (bpname) {
+                    char *cn = make_cname(bpname, false);
+                    emit(ctx, "const char *%s = _buf_%d;\n", cn, tmp);
+                    free(cn);
+                }
+                if (blk->body) {
+                    bool saved_ir = ctx->implicit_return;
+                    ctx->implicit_return = false;
+                    codegen_stmts(ctx, (pm_node_t *)blk->body);
+                    ctx->implicit_return = saved_ir;
+                }
+                ctx->indent--;
+                emit(ctx, "}\n");
+                emit(ctx, "}\n");
+                free(recv); free(bpname); free(method);
+                break;
+            }
+        }
+
+        /* f.puts / f.write / f.flock / f.seek / f.close on FILE-typed receiver (statement) */
+        if (call->receiver && (strcmp(method, "puts") == 0 || strcmp(method, "write") == 0 ||
+            strcmp(method, "flock") == 0 || strcmp(method, "seek") == 0 ||
+            strcmp(method, "close") == 0)) {
+            vtype_t recv_t = infer_type(ctx, call->receiver);
+            if (recv_t.kind == SPINEL_TYPE_FILE) {
+                char *recv = codegen_expr(ctx, call->receiver);
+                if (strcmp(method, "puts") == 0) {
+                    if (call->arguments && call->arguments->arguments.size > 0) {
+                        char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                        emit(ctx, "sp_File_puts(%s, %s);\n", recv, arg);
+                        free(arg);
+                    } else {
+                        emit(ctx, "fputc('\\n', %s->fp);\n", recv);
+                    }
+                } else if (strcmp(method, "write") == 0 && call->arguments &&
+                           call->arguments->arguments.size > 0) {
+                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    emit(ctx, "sp_File_write_str(%s, %s);\n", recv, arg);
+                    free(arg);
+                } else if (strcmp(method, "flock") == 0 && call->arguments &&
+                           call->arguments->arguments.size > 0) {
+                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    emit(ctx, "flock(fileno(%s->fp), %s);\n", recv, arg);
+                    free(arg);
+                } else if (strcmp(method, "seek") == 0 && call->arguments &&
+                           call->arguments->arguments.size > 0) {
+                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    emit(ctx, "fseek(%s->fp, (long)%s, SEEK_SET);\n", recv, arg);
+                    free(arg);
+                } else if (strcmp(method, "close") == 0) {
+                    emit(ctx, "sp_File_close(%s);\n", recv);
+                }
+                free(recv); free(method);
+                break;
+            }
+        }
+
         /* String#each_line with block → split by newline and iterate */
         if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
             strcmp(method, "each_line") == 0 && call->receiver) {
@@ -8943,6 +9130,37 @@ static void emit_header(codegen_ctx_t *ctx) {
     emit_raw(ctx, "static const char *sp_File_readlink(const char *path) {\n");
     emit_raw(ctx, "    char *buf = (char *)malloc(4096); ssize_t n = readlink(path, buf, 4095);\n");
     emit_raw(ctx, "    if (n < 0) { free(buf); return \"\"; } buf[n] = '\\0'; return buf;\n}\n\n");
+
+    /* ---- sp_File: file object for File.open block ---- */
+    emit_raw(ctx, "#include <sys/file.h>\n");
+    emit_raw(ctx, "typedef struct { FILE *fp; } sp_File;\n");
+    emit_raw(ctx, "#define sp_File_LOCK_EX LOCK_EX\n");
+    emit_raw(ctx, "#define sp_File_LOCK_SH LOCK_SH\n");
+    emit_raw(ctx, "#define sp_File_LOCK_UN LOCK_UN\n");
+    emit_raw(ctx, "#define sp_File_LOCK_NB LOCK_NB\n");
+    emit_raw(ctx, "static sp_File *sp_File_open(const char *path, const char *mode) {\n");
+    emit_raw(ctx, "    sp_File *f = (sp_File *)malloc(sizeof(sp_File));\n");
+    emit_raw(ctx, "    f->fp = fopen(path, mode);\n");
+    emit_raw(ctx, "    return f;\n}\n");
+    emit_raw(ctx, "static void sp_File_close(sp_File *f) {\n");
+    emit_raw(ctx, "    if (f && f->fp) fclose(f->fp); free(f);\n}\n");
+    emit_raw(ctx, "static void sp_File_puts(sp_File *f, const char *s) {\n");
+    emit_raw(ctx, "    fputs(s, f->fp); fputc('\\n', f->fp);\n}\n");
+    emit_raw(ctx, "static void sp_File_write_str(sp_File *f, const char *s) {\n");
+    emit_raw(ctx, "    fputs(s, f->fp);\n}\n");
+    emit_raw(ctx, "static const char *sp_File_readline(sp_File *f) {\n");
+    emit_raw(ctx, "    char *buf = (char *)malloc(4096);\n");
+    emit_raw(ctx, "    if (!fgets(buf, 4096, f->fp)) { free(buf); return \"\"; }\n");
+    emit_raw(ctx, "    size_t n = strlen(buf);\n");
+    emit_raw(ctx, "    if (n > 0 && buf[n-1] == '\\n') buf[n-1] = '\\0';\n");
+    emit_raw(ctx, "    return buf;\n}\n");
+    emit_raw(ctx, "static const char *sp_File_read_all(sp_File *f) {\n");
+    emit_raw(ctx, "    long cur = ftell(f->fp); fseek(f->fp, 0, SEEK_END);\n");
+    emit_raw(ctx, "    long len = ftell(f->fp); fseek(f->fp, cur, SEEK_SET);\n");
+    emit_raw(ctx, "    long remain = len - cur;\n");
+    emit_raw(ctx, "    char *buf = (char *)malloc(remain + 1);\n");
+    emit_raw(ctx, "    fread(buf, 1, remain, f->fp); buf[remain] = 0;\n");
+    emit_raw(ctx, "    return buf;\n}\n\n");
 
     /* ---- Additional string helpers ---- */
     emit_raw(ctx, "static const char *sp_str_strip(const char *s) {\n");
@@ -11283,6 +11501,11 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
             }
             else if (v->type.kind == SPINEL_TYPE_SP_STRING) {
                 emit_raw(ctx, "    sp_String *%s = NULL;\n", cn);
+                free(ct); free(cn);
+                continue;
+            }
+            else if (v->type.kind == SPINEL_TYPE_FILE) {
+                emit_raw(ctx, "    sp_File *%s = NULL;\n", cn);
                 free(ct); free(cn);
                 continue;
             }

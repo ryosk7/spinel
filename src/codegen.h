@@ -34,6 +34,7 @@ typedef enum {
     SPINEL_TYPE_RB_ARRAY,  /* sp_RbArray * (heterogeneous array of sp_RbValue) */
     SPINEL_TYPE_RB_HASH,   /* sp_RbHash * (heterogeneous hash: string key → sp_RbValue) */
     SPINEL_TYPE_SP_STRING, /* sp_String * (mutable, GC-managed string) */
+    SPINEL_TYPE_FILE,      /* sp_File * (file object wrapping FILE *) */
 } spinel_type_t;
 
 /* Extended type: kind + optional class name for OBJECT types */
@@ -222,6 +223,9 @@ typedef struct {
 
     /* sp_String: true when mutable strings (<<) are used */
     bool needs_sp_string;
+
+    /* File I/O: true when sp_File (file object with block) is used */
+    bool needs_file_io;
 
     /* Regexp: true when any regex literal is used */
     bool needs_regexp;
