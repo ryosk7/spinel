@@ -328,7 +328,7 @@ lrama ソース: `/home/matz/work/lrama/` (Spinel 対応修正はここで行う
 - Racc 対応のドロップも検討
 
 **Step 5: StringScanner stub (C実装)**
-- stubs/strscan.rb (型定義) + stubs/strscan.c (oniguruma ベース)
+- lib/strscan.rb (型定義) + lib/strscan.c (oniguruma ベース)
 - scan, matched, eos?, getch, pos, check, peek, scan_until
 
 **Step 6: C コンパイル通過 → 実行形式生成**
