@@ -2059,6 +2059,18 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
     for (int i = 0; i < ctx->class_count; i++)
         ctx->classes[i].class_tag = 0x0040 + i; /* NaN-box class tag base */
 
+    /* For large multi-file programs, enable all runtime features */
+    if (ctx->required_file_count > 5) {
+        ctx->needs_hash = true;
+        ctx->needs_rb_array = true;
+        ctx->needs_rb_hash = true;
+        ctx->needs_poly = true;
+        ctx->needs_sp_string = true;
+        ctx->needs_str_split = true;
+        ctx->needs_gc = true;
+        ctx->needs_proc = true;
+    }
+
     /* Detect needs from class ivars and method params/returns */
     for (int ci = 0; ci < ctx->class_count; ci++) {
         class_info_t *cls = &ctx->classes[ci];
