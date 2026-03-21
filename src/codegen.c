@@ -401,6 +401,7 @@ static void analyze_method(codegen_ctx_t *ctx, class_info_t *cls,
                 char *pname = cstr(ctx, kp->name);
                 snprintf(m->params[m->param_count].name, 64, "%s", pname);
                 m->params[m->param_count].type = vt_prim(SPINEL_TYPE_VALUE);
+                m->params[m->param_count].is_keyword = true;
                 m->param_count++;
                 free(pname);
             }
@@ -410,6 +411,7 @@ static void analyze_method(codegen_ctx_t *ctx, class_info_t *cls,
                 snprintf(m->params[m->param_count].name, 64, "%s", pname);
                 m->params[m->param_count].type = infer_type(ctx, kp->value);
                 m->params[m->param_count].is_optional = true;
+                m->params[m->param_count].is_keyword = true;
                 m->params[m->param_count].default_node = kp->value;
                 m->param_count++;
                 free(pname);
@@ -870,8 +872,94 @@ static void analyze_class(codegen_ctx_t *ctx, pm_class_node_t *node) {
                         memset(m, 0, sizeof(*m));
                         snprintf(m->name, sizeof(m->name), "%s", dname);
                         m->return_type = vt_prim(SPINEL_TYPE_VALUE);
+                        /* Try to resolve delegate target's method signature */
+                        for (int ci = 0; ci < ctx->class_count; ci++) {
+                            if (&ctx->classes[ci] == cls) continue;
+                            method_info_t *target = find_method(&ctx->classes[ci], dname);
+                            if (target && target->param_count > 0) {
+                                m->param_count = target->param_count;
+                                for (int pi = 0; pi < target->param_count; pi++)
+                                    m->params[pi] = target->params[pi];
+                                m->return_type = target->return_type;
+                                break;
+                            }
+                        }
                     }
                 }
+            }
+            free(cname);
+        }
+        /* Constants defined in class body (e.g., CONST = value) */
+        else if (PM_NODE_TYPE(s) == PM_CONSTANT_WRITE_NODE) {
+            pm_constant_write_node_t *cw = (pm_constant_write_node_t *)s;
+            char *cname = cstr(ctx, cw->name);
+            /* Register as global constant variable so codegen can find it */
+            if (!find_class(ctx, cname)) {
+                vtype_t type = vt_prim(SPINEL_TYPE_INTEGER);
+                if (cw->value) {
+                    switch (PM_NODE_TYPE(cw->value)) {
+                    case PM_STRING_NODE:
+                        type = vt_prim(SPINEL_TYPE_STRING);
+                        break;
+                    case PM_INTEGER_NODE:
+                        type = vt_prim(SPINEL_TYPE_INTEGER);
+                        break;
+                    case PM_FLOAT_NODE:
+                        type = vt_prim(SPINEL_TYPE_FLOAT);
+                        break;
+                    case PM_TRUE_NODE: case PM_FALSE_NODE:
+                        type = vt_prim(SPINEL_TYPE_BOOLEAN);
+                        break;
+                    case PM_CALL_NODE: {
+                        pm_call_node_t *vc = (pm_call_node_t *)cw->value;
+                        char *mn = cstr(ctx, vc->name);
+                        if (strcmp(mn, "to_f") == 0)
+                            type = vt_prim(SPINEL_TYPE_FLOAT);
+                        else if (strcmp(mn, "freeze") == 0) {
+                            /* Check receiver for type: "str".freeze → STRING, [...].freeze → ARRAY */
+                            if (vc->receiver) {
+                                switch (PM_NODE_TYPE(vc->receiver)) {
+                                case PM_STRING_NODE:
+                                    type = vt_prim(SPINEL_TYPE_STRING);
+                                    break;
+                                case PM_ARRAY_NODE:
+                                    type = vt_prim(SPINEL_TYPE_ARRAY);
+                                    break;
+                                case PM_HASH_NODE:
+                                    type = vt_prim(SPINEL_TYPE_HASH);
+                                    break;
+                                case PM_SYMBOL_NODE:
+                                    type = vt_prim(SPINEL_TYPE_STRING);
+                                    break;
+                                default:
+                                    type = vt_prim(SPINEL_TYPE_INTEGER);
+                                    break;
+                                }
+                            }
+                        } else
+                            type = vt_prim(SPINEL_TYPE_INTEGER);
+                        free(mn);
+                        break;
+                    }
+                    case PM_HASH_NODE:
+                        type = vt_prim(SPINEL_TYPE_HASH);
+                        break;
+                    case PM_ARRAY_NODE:
+                        type = vt_prim(SPINEL_TYPE_ARRAY);
+                        break;
+                    case PM_SYMBOL_NODE:
+                        type = vt_prim(SPINEL_TYPE_STRING);
+                        break;
+                    case PM_CONSTANT_PATH_NODE:
+                        /* Float::INFINITY → FLOAT */
+                        type = vt_prim(SPINEL_TYPE_FLOAT);
+                        break;
+                    default:
+                        type = vt_prim(SPINEL_TYPE_INTEGER);
+                        break;
+                    }
+                }
+                var_declare(ctx, cname, type, true);
             }
             free(cname);
         }
@@ -899,6 +987,44 @@ static void analyze_class(codegen_ctx_t *ctx, pm_class_node_t *node) {
                                  "%s", new_name);
                         cls->method_count++;
                         break;
+                    }
+                }
+            }
+        }
+        /* begin ... rescue ... end blocks in class body */
+        else if (PM_NODE_TYPE(s) == PM_BEGIN_NODE) {
+            pm_begin_node_t *bn = (pm_begin_node_t *)s;
+            /* Walk begin body for constant writes */
+            pm_node_t *parts[3] = { NULL, NULL, NULL };
+            int nparts = 0;
+            if (bn->statements) parts[nparts++] = (pm_node_t *)bn->statements;
+            if (bn->rescue_clause && bn->rescue_clause->statements)
+                parts[nparts++] = (pm_node_t *)bn->rescue_clause->statements;
+            if (bn->ensure_clause && bn->ensure_clause->statements)
+                parts[nparts++] = (pm_node_t *)bn->ensure_clause->statements;
+            for (int pi = 0; pi < nparts; pi++) {
+                pm_node_t *part = parts[pi];
+                if (PM_NODE_TYPE(part) != PM_STATEMENTS_NODE) continue;
+                pm_statements_node_t *pstmts = (pm_statements_node_t *)part;
+                for (size_t j = 0; j < pstmts->body.size; j++) {
+                    pm_node_t *ps = pstmts->body.nodes[j];
+                    if (PM_NODE_TYPE(ps) == PM_CONSTANT_WRITE_NODE) {
+                        pm_constant_write_node_t *cw = (pm_constant_write_node_t *)ps;
+                        char *cname = cstr(ctx, cw->name);
+                        if (!find_class(ctx, cname)) {
+                            vtype_t type = vt_prim(SPINEL_TYPE_INTEGER);
+                            if (cw->value) {
+                                switch (PM_NODE_TYPE(cw->value)) {
+                                case PM_STRING_NODE: type = vt_prim(SPINEL_TYPE_STRING); break;
+                                case PM_INTEGER_NODE: type = vt_prim(SPINEL_TYPE_INTEGER); break;
+                                case PM_FLOAT_NODE: type = vt_prim(SPINEL_TYPE_FLOAT); break;
+                                case PM_SYMBOL_NODE: type = vt_prim(SPINEL_TYPE_STRING); break;
+                                default: break;
+                                }
+                            }
+                            var_declare(ctx, cname, type, true);
+                        }
+                        free(cname);
                     }
                 }
             }

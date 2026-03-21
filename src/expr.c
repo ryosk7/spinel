@@ -1042,6 +1042,8 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                     }
                     /* Fill in default values for optional params */
                     if (init_m) {
+                        pm_parser_t *saved_p = ctx->parser;
+                        if (init_m->origin_parser) ctx->parser = init_m->origin_parser;
                         for (int i = argc; i < init_m->param_count; i++) {
                             if (init_m->params[i].is_optional && init_m->params[i].default_node) {
                                 char *def = codegen_expr(ctx, (pm_node_t *)init_m->params[i].default_node);
@@ -1050,6 +1052,7 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                                 args = na;
                             }
                         }
+                        ctx->parser = saved_p;
                     }
                 }
                 char *r = sfmt("sp_%s_new(%s)", cls_name, args);
@@ -1144,6 +1147,20 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                         char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
                         char *na = sfmt("%s%s%s", args, i > 0 ? ", " : "", a);
                         free(args); free(a); args = na;
+                    }
+                    /* Fill in default values for optional params */
+                    if (init_m) {
+                        pm_parser_t *saved_p = ctx->parser;
+                        if (init_m->origin_parser) ctx->parser = init_m->origin_parser;
+                        for (int i = argc; i < init_m->param_count; i++) {
+                            if (init_m->params[i].is_optional && init_m->params[i].default_node) {
+                                char *def = codegen_expr(ctx, (pm_node_t *)init_m->params[i].default_node);
+                                char *na = sfmt("%s%s%s", args, i > 0 ? ", " : "", def);
+                                free(args); free(def);
+                                args = na;
+                            }
+                        }
+                        ctx->parser = saved_p;
                     }
                 }
                 char *r = sfmt("sp_%s_new(%s)", cls_name, args);
@@ -3069,11 +3086,59 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                         /* Direct method call (with cast if inherited) */
                         int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
                         char *args = xstrdup("");
-                        for (int i = 0; i < argc; i++) {
-                            char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
-                            char *na = sfmt("%s, %s", args, a);
-                            free(args); free(a);
-                            args = na;
+                        bool has_kw_hash2 = (argc > 0 &&
+                            PM_NODE_TYPE(call->arguments->arguments.nodes[argc - 1]) == PM_KEYWORD_HASH_NODE);
+                        bool method_has_kw2 = (m->param_count > 0 && m->params[m->param_count - 1].is_keyword);
+                        if (has_kw_hash2 && method_has_kw2) {
+                            /* Unpack keyword hash for keyword methods */
+                            int pos_argc = argc - 1;
+                            for (int i = 0; i < pos_argc; i++) {
+                                char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
+                                char *na = sfmt("%s, %s", args, a);
+                                free(args); free(a); args = na;
+                            }
+                            pm_keyword_hash_node_t *kwh = (pm_keyword_hash_node_t *)call->arguments->arguments.nodes[argc - 1];
+                            for (int pi = 0; pi < m->param_count; pi++) {
+                                if (!m->params[pi].is_keyword) continue;
+                                char *val = NULL;
+                                for (size_t ki = 0; ki < kwh->elements.size; ki++) {
+                                    if (PM_NODE_TYPE(kwh->elements.nodes[ki]) != PM_ASSOC_NODE) continue;
+                                    pm_assoc_node_t *assoc = (pm_assoc_node_t *)kwh->elements.nodes[ki];
+                                    if (PM_NODE_TYPE(assoc->key) == PM_SYMBOL_NODE) {
+                                        pm_symbol_node_t *ksym = (pm_symbol_node_t *)assoc->key;
+                                        const uint8_t *ksrc = pm_string_source(&ksym->unescaped);
+                                        size_t klen = pm_string_length(&ksym->unescaped);
+                                        char kname[64]; snprintf(kname, sizeof(kname), "%.*s", (int)klen, ksrc);
+                                        if (strcmp(kname, m->params[pi].name) == 0) {
+                                            val = codegen_expr(ctx, assoc->value);
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (!val) {
+                                    if (m->params[pi].is_optional && m->params[pi].default_node) {
+                                        pm_parser_t *sp = ctx->parser;
+                                        if (m->origin_parser) ctx->parser = m->origin_parser;
+                                        val = codegen_expr(ctx, (pm_node_t *)m->params[pi].default_node);
+                                        ctx->parser = sp;
+                                    } else {
+                                        val = xstrdup("0");
+                                    }
+                                }
+                                char *na = sfmt("%s, %s", args, val);
+                                free(args); free(val); args = na;
+                            }
+                        } else {
+                            for (int i = 0; i < argc; i++) {
+                                /* Skip keyword hash if method has no keyword params */
+                                if (PM_NODE_TYPE(call->arguments->arguments.nodes[i]) == PM_KEYWORD_HASH_NODE
+                                    && !method_has_kw2)
+                                    continue;
+                                char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
+                                char *na = sfmt("%s, %s", args, a);
+                                free(args); free(a);
+                                args = na;
+                            }
                         }
 
                         const char *c_mname = sanitize_method(method);
@@ -3257,10 +3322,71 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
 
                 int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
                 char *args = xstrdup("");
-                for (int i = 0; i < argc; i++) {
-                    char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
-                    char *na = sfmt("%s, %s", args, a);
-                    free(args); free(a);
+                /* Check if last arg is keyword hash and method has keyword params */
+                bool has_kw_hash = (argc > 0 &&
+                    PM_NODE_TYPE(call->arguments->arguments.nodes[argc - 1]) == PM_KEYWORD_HASH_NODE);
+                bool method_has_kw = (m->param_count > 0 && m->params[m->param_count - 1].is_keyword);
+                if (has_kw_hash && method_has_kw) {
+                    /* Emit positional args first */
+                    int pos_argc = argc - 1;
+                    for (int i = 0; i < pos_argc; i++) {
+                        char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
+                        char *na = sfmt("%s, %s", args, a);
+                        free(args); free(a);
+                        args = na;
+                    }
+                    /* Unpack keyword hash by matching against method params */
+                    pm_keyword_hash_node_t *kwh = (pm_keyword_hash_node_t *)call->arguments->arguments.nodes[argc - 1];
+                    pm_parser_t *saved_p2 = ctx->parser;
+                    if (m->origin_parser) ctx->parser = m->origin_parser;
+                    for (int pi = 0; pi < m->param_count; pi++) {
+                        if (!m->params[pi].is_keyword) continue;
+                        char *val = NULL;
+                        for (size_t ki = 0; ki < kwh->elements.size; ki++) {
+                            if (PM_NODE_TYPE(kwh->elements.nodes[ki]) != PM_ASSOC_NODE) continue;
+                            pm_assoc_node_t *assoc = (pm_assoc_node_t *)kwh->elements.nodes[ki];
+                            if (PM_NODE_TYPE(assoc->key) == PM_SYMBOL_NODE) {
+                                pm_symbol_node_t *ksym = (pm_symbol_node_t *)assoc->key;
+                                const uint8_t *ksrc = pm_string_source(&ksym->unescaped);
+                                size_t klen = pm_string_length(&ksym->unescaped);
+                                char kname[64]; snprintf(kname, sizeof(kname), "%.*s", (int)klen, ksrc);
+                                if (strcmp(kname, m->params[pi].name) == 0) {
+                                    ctx->parser = saved_p2; /* use caller's parser for value */
+                                    val = codegen_expr(ctx, assoc->value);
+                                    if (m->origin_parser) ctx->parser = m->origin_parser;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!val) {
+                            /* Use default value if available */
+                            if (m->params[pi].is_optional && m->params[pi].default_node) {
+                                val = codegen_expr(ctx, (pm_node_t *)m->params[pi].default_node);
+                            } else {
+                                val = xstrdup("0");
+                            }
+                        }
+                        char *na = sfmt("%s, %s", args, val);
+                        free(args); free(val);
+                        args = na;
+                    }
+                    ctx->parser = saved_p2;
+                } else {
+                    for (int i = 0; i < argc; i++) {
+                        /* Skip keyword hash arg if method doesn't have keyword params */
+                        if (PM_NODE_TYPE(call->arguments->arguments.nodes[i]) == PM_KEYWORD_HASH_NODE
+                            && !method_has_kw)
+                            continue;
+                        char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
+                        char *na = sfmt("%s, %s", args, a);
+                        free(args); free(a);
+                        args = na;
+                    }
+                }
+                /* Add NULL block params for yield methods called without blocks */
+                if (m->body_node && has_yield_nodes(m->body_node) && !call->block) {
+                    char *na = sfmt("%s, NULL, NULL", args);
+                    free(args);
                     args = na;
                 }
                 const char *c_mname = sanitize_method(method);

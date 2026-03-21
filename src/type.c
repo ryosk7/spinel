@@ -1459,6 +1459,23 @@ void infer_pass(codegen_ctx_t *ctx, pm_node_t *node) {
         infer_pass(ctx, rm->rescue_expression);
         break;
     }
+    case PM_PARENTHESES_NODE: {
+        pm_parentheses_node_t *pn = (pm_parentheses_node_t *)node;
+        if (pn->body) infer_pass(ctx, pn->body);
+        break;
+    }
+    case PM_AND_NODE: {
+        pm_and_node_t *an = (pm_and_node_t *)node;
+        infer_pass(ctx, an->left);
+        infer_pass(ctx, an->right);
+        break;
+    }
+    case PM_OR_NODE: {
+        pm_or_node_t *on = (pm_or_node_t *)node;
+        infer_pass(ctx, on->left);
+        infer_pass(ctx, on->right);
+        break;
+    }
     case PM_RESCUE_NODE:
     case PM_RETRY_NODE:
         break;

@@ -1964,11 +1964,11 @@ void emit_header(codegen_ctx_t *ctx) {
             emit_raw(ctx, "    return h;\n}\n\n");
         }
 
-        emit_raw(ctx, "static void sp_StrIntHash_set(sp_StrIntHash *h, const char *key, mrb_int value) {\n");
+        emit_raw(ctx, "static mrb_int sp_StrIntHash_set(sp_StrIntHash *h, const char *key, mrb_int value) {\n");
         emit_raw(ctx, "    unsigned idx = sp_hash_str(key) %% h->cap;\n");
         emit_raw(ctx, "    sp_HashEntry *e = h->buckets[idx];\n");
         emit_raw(ctx, "    while (e) {\n");
-        emit_raw(ctx, "        if (strcmp(e->key, key) == 0) { e->value = value; return; }\n");
+        emit_raw(ctx, "        if (strcmp(e->key, key) == 0) { e->value = value; return value; }\n");
         emit_raw(ctx, "        e = e->next;\n");
         emit_raw(ctx, "    }\n");
         emit_raw(ctx, "    e = (sp_HashEntry *)malloc(sizeof(sp_HashEntry));\n");
@@ -1982,6 +1982,7 @@ void emit_header(codegen_ctx_t *ctx) {
         emit_raw(ctx, "    if (h->last) h->last->order_next = e; else h->first = e;\n");
         emit_raw(ctx, "    h->last = e;\n");
         emit_raw(ctx, "    h->size++;\n");
+        emit_raw(ctx, "    return value;\n");
         emit_raw(ctx, "}\n\n");
 
         emit_raw(ctx, "static mrb_int sp_StrIntHash_get(sp_StrIntHash *h, const char *key) {\n");
