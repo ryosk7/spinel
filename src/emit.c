@@ -1270,6 +1270,8 @@ void emit_header(codegen_ctx_t *ctx) {
         emit_raw(ctx, "    memcpy(s->data, t, tlen + 1); s->len = tlen;\n}\n");
         emit_raw(ctx, "static void sp_String_clear(sp_String *s) { s->data[0] = '\\0'; s->len = 0; }\n");
         emit_raw(ctx, "static sp_String *sp_String_dup(sp_String *s) { return sp_String_new(s->data); }\n");
+        emit_raw(ctx, "static void sp_String_setbyte(sp_String *s, mrb_int i, mrb_int b) {\n");
+        emit_raw(ctx, "    if (i >= 0 && i < s->len) s->data[i] = (char)b;\n}\n");
         emit_raw(ctx, "static const char *sp_String_char_at(sp_String *s, int64_t idx) {\n");
         emit_raw(ctx, "    if (idx < 0) idx += s->len;\n");
         emit_raw(ctx, "    if (idx < 0 || idx >= s->len) return \"\";\n");

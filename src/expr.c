@@ -2481,6 +2481,14 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                     r = sfmt("((mrb_int)strtol(%s, NULL, 10))", recv);
                 else if (strcmp(method, "ord") == 0)
                     r = sfmt("((mrb_int)(unsigned char)(%s)[0])", recv);
+                else if (strcmp(method, "getbyte") == 0 && call->arguments &&
+                         call->arguments->arguments.size == 1) {
+                    char *idx = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    r = sfmt("((mrb_int)(unsigned char)(%s)[%s])", recv, idx);
+                    free(idx);
+                }
+                else if (strcmp(method, "bytesize") == 0)
+                    r = sfmt("((mrb_int)strlen(%s))", recv);
                 else if (strcmp(method, "to_sym") == 0)
                     r = sfmt("%s", recv); /* symbols are strings in Spinel */
                 else if (strcmp(method, "each_line") == 0) {
@@ -2555,7 +2563,8 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                 else if (strcmp(method, "to_s") == 0)
                     r = sfmt("%s", recv); /* string.to_s → identity */
                 else if (strcmp(method, "dup") == 0) {
-                    r = sfmt("sp_str_concat(%s, \"\")", recv); /* copy */
+                    ctx->needs_sp_string = true;
+                    r = sfmt("sp_String_new(%s)", recv); /* mutable copy */
                 }
                 else if (strcmp(method, "slice") == 0 && call->arguments &&
                          call->arguments->arguments.size == 2) {
@@ -2734,6 +2743,21 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                     r = sfmt("sp_str_to_f(sp_String_cstr(%s))", recv);
                 else if (strcmp(method, "ord") == 0)
                     r = sfmt("((mrb_int)(unsigned char)(sp_String_cstr(%s))[0])", recv);
+                else if (strcmp(method, "getbyte") == 0 && call->arguments &&
+                         call->arguments->arguments.size == 1) {
+                    char *idx = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    r = sfmt("((mrb_int)(unsigned char)sp_String_cstr(%s)[%s])", recv, idx);
+                    free(idx);
+                }
+                else if (strcmp(method, "setbyte") == 0 && call->arguments &&
+                         call->arguments->arguments.size == 2) {
+                    char *idx = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    char *val = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
+                    r = sfmt("(sp_String_setbyte(%s, %s, %s), %s)", recv, idx, val, val);
+                    free(idx); free(val);
+                }
+                else if (strcmp(method, "bytesize") == 0)
+                    r = sfmt("sp_String_length(%s)", recv);
                 else if (strcmp(method, "match?") == 0 && call->arguments &&
                          call->arguments->arguments.size == 1) {
                     char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
@@ -2961,6 +2985,8 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                     r = sfmt("((%s) < (%s) ? (%s) : (%s) > (%s) ? (%s) : (%s))", recv, lo, lo, recv, hi, hi, recv);
                     free(lo); free(hi);
                 }
+                else if (strcmp(method, "succ") == 0)
+                    r = sfmt("((%s) + 1)", recv);
                 if (r) { free(recv); free(method); return r; }
                 free(recv);
             }

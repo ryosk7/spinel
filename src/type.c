@@ -504,12 +504,14 @@ vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
                     strcmp(method, "center") == 0 || strcmp(method, "lstrip") == 0 ||
                     strcmp(method, "rstrip") == 0 || strcmp(method, "tr") == 0 ||
                     strcmp(method, "delete") == 0 || strcmp(method, "squeeze") == 0 ||
-                    strcmp(method, "slice") == 0 || strcmp(method, "dup") == 0 ||
+                    strcmp(method, "slice") == 0 ||
                     strcmp(method, "freeze") == 0 || strcmp(method, "to_s") == 0) { free(method); return vt_prim(SPINEL_TYPE_STRING); }
+                if (strcmp(method, "dup") == 0) { ctx->needs_sp_string = true; free(method); return vt_prim(SPINEL_TYPE_SP_STRING); }
                 if (strcmp(method, "frozen?") == 0) { free(method); return vt_prim(SPINEL_TYPE_BOOLEAN); }
                 if (strcmp(method, "chars") == 0) { free(method); return vt_prim(SPINEL_TYPE_STR_ARRAY); }
                 if (strcmp(method, "bytes") == 0) { free(method); return vt_prim(SPINEL_TYPE_ARRAY); }
                 if (strcmp(method, "hex") == 0 || strcmp(method, "oct") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
+                if (strcmp(method, "getbyte") == 0 || strcmp(method, "bytesize") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
             }
             /* sp_String (mutable string) methods */
             if (recv_t.kind == SPINEL_TYPE_SP_STRING) {
@@ -537,6 +539,8 @@ vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
                     strcmp(method, "match?") == 0) { free(method); return vt_prim(SPINEL_TYPE_BOOLEAN); }
                 if (strcmp(method, "to_i") == 0 || strcmp(method, "count") == 0 ||
                     strcmp(method, "ord") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
+                if (strcmp(method, "getbyte") == 0 || strcmp(method, "setbyte") == 0 ||
+                    strcmp(method, "bytesize") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
                 if (strcmp(method, "to_f") == 0) { free(method); return vt_prim(SPINEL_TYPE_FLOAT); }
                 if (strcmp(method, "each_line") == 0 || strcmp(method, "chars") == 0) { free(method); return vt_prim(SPINEL_TYPE_STR_ARRAY); }
                 if (strcmp(method, "bytes") == 0) { free(method); return vt_prim(SPINEL_TYPE_ARRAY); }
@@ -586,7 +590,8 @@ vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
             }
             /* Numeric methods */
             if (recv_t.kind == SPINEL_TYPE_INTEGER) {
-                if (strcmp(method, "abs") == 0 || strcmp(method, "clamp") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
+                if (strcmp(method, "abs") == 0 || strcmp(method, "clamp") == 0 ||
+                    strcmp(method, "succ") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
                 if (strcmp(method, "even?") == 0 || strcmp(method, "odd?") == 0 ||
                     strcmp(method, "zero?") == 0 || strcmp(method, "positive?") == 0 ||
                     strcmp(method, "negative?") == 0) { free(method); return vt_prim(SPINEL_TYPE_BOOLEAN); }
@@ -1266,6 +1271,12 @@ void infer_pass(codegen_ctx_t *ctx, pm_node_t *node) {
         if (call->arguments) {
             for (size_t i = 0; i < call->arguments->arguments.size; i++)
                 infer_pass(ctx, call->arguments->arguments.nodes[i]);
+        }
+        /* Detect String#dup: ensure sp_String runtime is emitted */
+        if (call->receiver && ceq(ctx, call->name, "dup")) {
+            vtype_t recv_t = infer_type(ctx, call->receiver);
+            if (recv_t.kind == SPINEL_TYPE_STRING || recv_t.kind == SPINEL_TYPE_SP_STRING)
+                ctx->needs_sp_string = true;
         }
         /* Detect String << / replace / clear : widen STRING variable to SP_STRING (mutable) */
         if (call->receiver && (ceq(ctx, call->name, "<<") || ceq(ctx, call->name, "replace") || ceq(ctx, call->name, "clear")) &&
