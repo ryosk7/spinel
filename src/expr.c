@@ -271,6 +271,7 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
             strcmp(method, "protected") == 0 || strcmp(method, "public") == 0 ||
             strcmp(method, "extend") == 0 || strcmp(method, "include") == 0 ||
             strcmp(method, "def_delegators") == 0 ||
+            strcmp(method, "define_method") == 0 ||
             strcmp(method, "frozen_string_literal") == 0)) {
             free(method);
             return xstrdup("0");

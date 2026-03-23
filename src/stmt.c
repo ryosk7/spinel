@@ -567,7 +567,8 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                 (strcmp(_mname, "private") == 0 ||
                  strcmp(_mname, "protected") == 0 ||
                  strcmp(_mname, "public") == 0 ||
-                 strcmp(_mname, "extend") == 0)) {
+                 strcmp(_mname, "extend") == 0 ||
+                 strcmp(_mname, "define_method") == 0)) {
                 free(_mname);
                 break;
             }

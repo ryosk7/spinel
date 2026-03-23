@@ -1,13 +1,8 @@
 # send_bmethod benchmark (from yjit-bench)
-# define_method replaced with def (equivalent for AOT)
+# define_method with static block → compiled as def
 
-def zero
-  0
-end
-
-def one(arg)
-  arg
-end
+define_method(:zero) { 0 }
+define_method(:one) { |arg| arg }
 
 total = 0
 n = 0

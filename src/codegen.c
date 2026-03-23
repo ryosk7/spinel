@@ -1378,6 +1378,53 @@ void class_analysis_pass(codegen_ctx_t *ctx, pm_node_t *root) {
         case PM_DEF_NODE:
             analyze_top_func(ctx, (pm_def_node_t *)s);
             break;
+        case PM_CALL_NODE: {
+            /* Detect define_method(:name) { body } → register as top-level function */
+            pm_call_node_t *dm = (pm_call_node_t *)s;
+            if (!dm->receiver && ceq(ctx, dm->name, "define_method") &&
+                dm->arguments && dm->arguments->arguments.size == 1 &&
+                PM_NODE_TYPE(dm->arguments->arguments.nodes[0]) == PM_SYMBOL_NODE &&
+                dm->block && PM_NODE_TYPE(dm->block) == PM_BLOCK_NODE) {
+                pm_symbol_node_t *sym = (pm_symbol_node_t *)dm->arguments->arguments.nodes[0];
+                pm_block_node_t *blk = (pm_block_node_t *)dm->block;
+                const uint8_t *nsrc = pm_string_source(&sym->unescaped);
+                size_t nlen = pm_string_length(&sym->unescaped);
+                char mname[64];
+                snprintf(mname, sizeof(mname), "%.*s", (int)nlen, nsrc);
+
+                if (ctx->func_count < MAX_FUNCS) {
+                    func_info_t *f = &ctx->funcs[ctx->func_count++];
+                    memset(f, 0, sizeof(*f));
+                    char *safe = c_safe_name(mname);
+                    snprintf(f->name, sizeof(f->name), "%s", safe);
+                    free(safe);
+                    f->body_node = blk->body ? (pm_node_t *)blk->body : NULL;
+                    f->return_type = vt_prim(SPINEL_TYPE_VALUE);
+                    /* func_info_t doesn't have origin_parser; uses ctx->parser at emit time */
+
+                    /* Extract block parameters as function parameters */
+                    if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
+                        pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
+                        if (bp->parameters) {
+                            for (size_t pi = 0; pi < bp->parameters->requireds.size && f->param_count < MAX_PARAMS; pi++) {
+                                pm_node_t *p = bp->parameters->requireds.nodes[pi];
+                                if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE) {
+                                    pm_required_parameter_node_t *rp = (pm_required_parameter_node_t *)p;
+                                    char *pname = cstr(ctx, rp->name);
+                                    snprintf(f->params[f->param_count].name, 64, "%s", pname);
+                                    f->params[f->param_count].type = vt_prim(SPINEL_TYPE_VALUE);
+                                    f->param_count++;
+                                    free(pname);
+                                }
+                            }
+                        }
+                    }
+                    /* Detect yield in block body */
+                    f->has_yield = f->body_node ? has_yield_nodes(f->body_node) : false;
+                }
+            }
+            break;
+        }
         case PM_CONSTANT_WRITE_NODE: {
             /* Detect Struct.new(:x, :y) → synthetic class */
             pm_constant_write_node_t *cw = (pm_constant_write_node_t *)s;
