@@ -90,6 +90,1432 @@ void codegen_pattern_cond(codegen_ctx_t *ctx, pm_node_t *pattern, int case_id) {
     }
 }
 
+/* Forward declarations */
+void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node);
+void codegen_stmts(codegen_ctx_t *ctx, pm_node_t *node);
+
+/* ------------------------------------------------------------------ */
+/* PM_CALL_NODE handler (extracted from codegen_stmt)                  */
+/* ------------------------------------------------------------------ */
+static void codegen_stmt_call(codegen_ctx_t *ctx, pm_call_node_t *call, pm_node_t *node) {
+
+    /* require/require_relative are compile-time directives — skip at codegen */
+    if (is_require_relative(ctx, node) || is_require(ctx, node))
+        return;
+
+    /* private/protected/public/extend — access modifiers and runtime
+     * mixin operations are no-ops in AOT */
+    {
+        char *_mname = cstr(ctx, call->name);
+        if (!call->receiver &&
+            (strcmp(_mname, "private") == 0 ||
+             strcmp(_mname, "protected") == 0 ||
+             strcmp(_mname, "public") == 0 ||
+             strcmp(_mname, "extend") == 0 ||
+             strcmp(_mname, "define_method") == 0)) {
+            free(_mname);
+            return;
+        }
+        free(_mname);
+    }
+
+    /* print int.chr → putchar */
+    if (!call->receiver && try_print_chr(ctx, call))
+        return;
+
+    char *method = cstr(ctx, call->name);
+
+    /* $stderr.puts / $stdout.puts */
+    if (call->receiver && PM_NODE_TYPE(call->receiver) == PM_GLOBAL_VARIABLE_READ_NODE &&
+        strcmp(method, "puts") == 0) {
+        pm_global_variable_read_node_t *gv = (pm_global_variable_read_node_t *)call->receiver;
+        char *gname = cstr(ctx, gv->name);
+        const char *stream = strcmp(gname, "$stderr") == 0 ? "stderr" : "stdout";
+        if (call->arguments && call->arguments->arguments.size > 0) {
+            char *ae = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            emit(ctx, "fprintf(%s, \"%%s\\n\", %s);\n", stream, ae);
+            free(ae);
+        } else {
+            emit(ctx, "fputc('\\n', %s);\n", stream);
+        }
+        free(gname); free(method);
+        return;
+    }
+
+    /* Kernel#exit — also handle exit(true)→0, exit(false)→1 */
+    if (!call->receiver && strcmp(method, "exit") == 0) {
+        if (call->arguments && call->arguments->arguments.size > 0) {
+            pm_node_t *arg0 = call->arguments->arguments.nodes[0];
+            if (PM_NODE_TYPE(arg0) == PM_TRUE_NODE) {
+                emit(ctx, "exit(0);\n");
+            } else if (PM_NODE_TYPE(arg0) == PM_FALSE_NODE) {
+                emit(ctx, "exit(1);\n");
+            } else {
+                char *code = codegen_expr(ctx, arg0);
+                emit(ctx, "exit((int)%s);\n", code);
+                free(code);
+            }
+        } else {
+            emit(ctx, "exit(0);\n");
+        }
+        free(method);
+        return;
+    }
+
+    /* Kernel#abort */
+    if (!call->receiver && strcmp(method, "abort") == 0) {
+        if (call->arguments && call->arguments->arguments.size > 0) {
+            char *msg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            emit(ctx, "fprintf(stderr, \"%%s\\n\", %s); exit(1);\n", msg);
+            free(msg);
+        } else {
+            emit(ctx, "exit(1);\n");
+        }
+        free(method);
+        return;
+    }
+
+    /* Kernel#sleep */
+    if (!call->receiver && strcmp(method, "sleep") == 0) {
+        if (call->arguments && call->arguments->arguments.size > 0) {
+            char *secs = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            emit(ctx, "sleep((unsigned int)%s);\n", secs);
+            free(secs);
+        } else {
+            emit(ctx, "pause();\n"); /* sleep forever */
+        }
+        free(method);
+        return;
+    }
+
+    /* Kernel#warn → fprintf(stderr, ...) */
+    if (!call->receiver && strcmp(method, "warn") == 0) {
+        if (call->arguments && call->arguments->arguments.size > 0) {
+            char *msg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            emit(ctx, "fprintf(stderr, \"%%s\\n\", %s);\n", msg);
+            free(msg);
+        } else {
+            emit(ctx, "fputc('\\n', stderr);\n");
+        }
+        free(method);
+        return;
+    }
+
+    /* puts: output + newline */
+    if (!call->receiver && strcmp(method, "puts") == 0) {
+        /* In lambda mode: puts on a StrArray variable → iterate and print each */
+        if (ctx->lambda_mode && call->arguments && call->arguments->arguments.size > 0) {
+            pm_node_t *arg = call->arguments->arguments.nodes[0];
+            vtype_t at = infer_type(ctx, arg);
+            /* If the argument type is PROC or VALUE (could be StrArray from map), handle specially */
+            if (at.kind == SPINEL_TYPE_PROC || at.kind == SPINEL_TYPE_VALUE ||
+                at.kind == SPINEL_TYPE_UNKNOWN) {
+                char *ae = codegen_expr(ctx, arg);
+                /* Emit: cast to sp_StrArray* and print each element */
+                int tmp = ctx->temp_counter++;
+                emit(ctx, "{ sp_StrArray *_pa_%d = (sp_StrArray *)%s;\n", tmp, ae);
+                emit(ctx, "  for (int _pi_%d = 0; _pi_%d < _pa_%d->len; _pi_%d++) puts(_pa_%d->data[_pi_%d]); }\n",
+                     tmp, tmp, tmp, tmp, tmp, tmp);
+                free(ae);
+                free(method);
+                return;
+            }
+        }
+        if (call->arguments && call->arguments->arguments.size > 0) {
+            pm_node_t *arg = call->arguments->arguments.nodes[0];
+            vtype_t at = infer_type(ctx, arg);
+            if (PM_NODE_TYPE(arg) == PM_INTERPOLATED_STRING_NODE) {
+                /* Generate printf for interpolated string */
+                pm_interpolated_string_node_t *is = (pm_interpolated_string_node_t *)arg;
+                /* Build format string and args */
+                char *fmt = xstrdup("");
+                char *args = xstrdup("");
+                for (size_t i = 0; i < is->parts.size; i++) {
+                    pm_node_t *part = is->parts.nodes[i];
+                    if (PM_NODE_TYPE(part) == PM_STRING_NODE) {
+                        pm_string_node_t *sn = (pm_string_node_t *)part;
+                        const uint8_t *src = pm_string_source(&sn->unescaped);
+                        size_t len = pm_string_length(&sn->unescaped);
+                        size_t bufsz = strlen(fmt) + len * 4 + 16;
+                        char *nf = malloc(bufsz);
+                        int pos = snprintf(nf, bufsz, "%s", fmt);
+                        for (size_t j = 0; j < len; j++) {
+                            uint8_t c = src[j];
+                            if (c == '\n') pos += snprintf(nf + pos, bufsz - pos, "\\n");
+                            else if (c == '\\') pos += snprintf(nf + pos, bufsz - pos, "\\\\");
+                            else if (c == '"') pos += snprintf(nf + pos, bufsz - pos, "\\\"");
+                            else if (c == '%') pos += snprintf(nf + pos, bufsz - pos, "%%%%");
+                            else pos += snprintf(nf + pos, bufsz - pos, "%c", c);
+                        }
+                        free(fmt); fmt = nf;
+                    } else if (PM_NODE_TYPE(part) == PM_EMBEDDED_STATEMENTS_NODE) {
+                        pm_embedded_statements_node_t *e = (pm_embedded_statements_node_t *)part;
+                        if (e->statements && e->statements->body.size > 0) {
+                            vtype_t et = infer_type(ctx, e->statements->body.nodes[0]);
+                            char *eexpr = codegen_expr(ctx, e->statements->body.nodes[0]);
+                            char *nf;
+                            if (et.kind == SPINEL_TYPE_INTEGER)
+                                nf = sfmt("%s%%lld", fmt);
+                            else if (et.kind == SPINEL_TYPE_FLOAT)
+                                nf = sfmt("%s%%g", fmt);
+                            else
+                                nf = sfmt("%s%%s", fmt);
+                            free(fmt); fmt = nf;
+                            char *na = sfmt("%s, (long long)%s", args, eexpr);
+                            free(args); free(eexpr);
+                            args = na;
+                        }
+                    }
+                }
+                emit(ctx, "printf(\"%s\\n\"%s);\n", fmt, args);
+                free(fmt); free(args);
+            } else if (at.kind == SPINEL_TYPE_STRING) {
+                char *ae = codegen_expr(ctx, arg);
+                emit(ctx, "{ const char *_ps = %s; fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '\\n') putchar('\\n'); }\n", ae);
+                free(ae);
+            } else if (at.kind == SPINEL_TYPE_SP_STRING) {
+                char *ae = codegen_expr(ctx, arg);
+                emit(ctx, "{ const char *_ps = sp_String_cstr(%s); fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '\\n') putchar('\\n'); }\n", ae);
+                free(ae);
+            } else if (at.kind == SPINEL_TYPE_BOOLEAN) {
+                char *ae = codegen_expr(ctx, arg);
+                emit(ctx, "puts(%s ? \"true\" : \"false\");\n", ae);
+                free(ae);
+            } else if (at.kind == SPINEL_TYPE_FLOAT) {
+                char *ae = codegen_expr(ctx, arg);
+                emit(ctx, "{ const char *_fs = sp_float_to_s(%s); printf(\"%%s\\n\", _fs); }\n", ae);
+                free(ae);
+            } else if (at.kind == SPINEL_TYPE_POLY) {
+                char *ae = codegen_expr(ctx, arg);
+                emit(ctx, "sp_poly_puts(%s);\n", ae);
+                free(ae);
+            } else if (at.kind == SPINEL_TYPE_NIL) {
+                emit(ctx, "putchar('\\n');\n");
+            } else {
+                char *ae = codegen_expr(ctx, arg);
+                emit(ctx, "printf(\"%%lld\\n\", (long long)%s);\n", ae);
+                free(ae);
+            }
+        } else {
+            emit(ctx, "putchar('\\n');\n");
+        }
+        free(method);
+        return;
+    }
+
+    /* print */
+    if (!call->receiver && strcmp(method, "print") == 0) {
+        if (!try_print_chr(ctx, call)) {
+            if (call->arguments && call->arguments->arguments.size > 0) {
+                char *ae = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                emit(ctx, "printf(\"%%s\", %s);\n", ae);
+                free(ae);
+            }
+        }
+        free(method);
+        return;
+    }
+
+    /* putc: output a single character (integer or string) */
+    if (!call->receiver && strcmp(method, "putc") == 0) {
+        if (call->arguments && call->arguments->arguments.size > 0) {
+            pm_node_t *arg = call->arguments->arguments.nodes[0];
+            vtype_t at = infer_type(ctx, arg);
+            char *ae = codegen_expr(ctx, arg);
+            if (at.kind == SPINEL_TYPE_INTEGER || at.kind == SPINEL_TYPE_FLOAT)
+                emit(ctx, "putchar((int)%s);\n", ae);
+            else if (at.kind == SPINEL_TYPE_STRING)
+                emit(ctx, "putchar(%s[0]);\n", ae);
+            else
+                emit(ctx, "putchar((int)%s);\n", ae);
+            free(ae);
+        }
+        free(method);
+        return;
+    }
+
+    /* printf with format string */
+    if (!call->receiver && strcmp(method, "printf") == 0) {
+        if (call->arguments && call->arguments->arguments.size >= 1) {
+            char *fmt = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            if (call->arguments->arguments.size == 1) {
+                emit(ctx, "printf(%s);\n", fmt);
+            } else {
+                emit(ctx, "printf(%s", fmt);
+                for (size_t i = 1; i < call->arguments->arguments.size; i++) {
+                    char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
+                    emit_raw(ctx, ", %s", a);
+                    free(a);
+                }
+                emit_raw(ctx, ");\n");
+            }
+            free(fmt);
+        }
+        free(method);
+        return;
+    }
+
+    /* p — debug print */
+    if (!call->receiver && strcmp(method, "p") == 0) {
+        if (call->arguments && call->arguments->arguments.size > 0) {
+            pm_node_t *arg = call->arguments->arguments.nodes[0];
+            vtype_t at = infer_type(ctx, arg);
+            char *ae = codegen_expr(ctx, arg);
+            if (at.kind == SPINEL_TYPE_STRING)
+                emit(ctx, "{ const char *_ps = %s; fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '\\n') putchar('\\n'); }\n", ae);
+            else
+                emit(ctx, "printf(\"%%lld\\n\", (long long)%s);\n", ae);
+            free(ae);
+        }
+        free(method);
+        return;
+    }
+
+    /* srand(n) → C srand */
+    if (!call->receiver && strcmp(method, "srand") == 0) {
+        if (call->arguments && call->arguments->arguments.size == 1) {
+            char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            emit(ctx, "srand((unsigned int)%s);\n", arg);
+            free(arg);
+        } else {
+            emit(ctx, "srand(0);\n");
+        }
+        free(method);
+        return;
+    }
+
+    /* exit(n) → exit(n) */
+    if (!call->receiver && strcmp(method, "exit") == 0) {
+        if (call->arguments && call->arguments->arguments.size == 1) {
+            char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            emit(ctx, "exit((int)%s);\n", arg);
+            free(arg);
+        } else {
+            emit(ctx, "exit(0);\n");
+        }
+        free(method);
+        return;
+    }
+
+    /* sleep(n) → sleep(n) (use unistd.h on POSIX) */
+    if (!call->receiver && strcmp(method, "sleep") == 0) {
+        if (call->arguments && call->arguments->arguments.size == 1) {
+            char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            emit(ctx, "sleep((unsigned int)%s);\n", arg);
+            free(arg);
+        } else {
+            emit(ctx, "sleep(0);\n");
+        }
+        free(method);
+        return;
+    }
+
+    /* system("cmd") → system("cmd") as statement */
+    if (!call->receiver && strcmp(method, "system") == 0) {
+        if (call->arguments && call->arguments->arguments.size >= 1) {
+            char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            emit(ctx, "fflush(stdout); sp_last_status = system(%s);\n", arg);
+            free(arg);
+        }
+        free(method);
+        return;
+    }
+
+    /* trap('SIGNAL') { block } → signal(SIGxxx, SIG_IGN) */
+    if (!call->receiver && strcmp(method, "trap") == 0) {
+        if (call->arguments && call->arguments->arguments.size >= 1) {
+            char *sig = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            /* Map Ruby signal names to C signal constants */
+            const char *csig = "SIGINT"; /* default */
+            /* Extract string content (remove quotes) for comparison */
+            if (strstr(sig, "INT")) csig = "SIGINT";
+            else if (strstr(sig, "WINCH")) csig = "SIGWINCH";
+            else if (strstr(sig, "TERM")) csig = "SIGTERM";
+            else if (strstr(sig, "HUP")) csig = "SIGHUP";
+            else if (strstr(sig, "PIPE")) csig = "SIGPIPE";
+            else if (strstr(sig, "USR1")) csig = "SIGUSR1";
+            else if (strstr(sig, "USR2")) csig = "SIGUSR2";
+            emit(ctx, "signal(%s, SIG_IGN);\n", csig);
+            free(sig);
+        }
+        free(method);
+        return;
+    }
+
+    /* loop do ... end → while (1) { body } */
+    if (!call->receiver && strcmp(method, "loop") == 0 &&
+        call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE) {
+        pm_block_node_t *blk = (pm_block_node_t *)call->block;
+        emit(ctx, "while (1) {\n");
+        ctx->indent++;
+        ctx->for_depth++;
+        if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+        ctx->for_depth--;
+        ctx->indent--;
+        emit(ctx, "}\n");
+        free(method);
+        return;
+    }
+
+    /* report_duration(:label) { block } → just execute the block body */
+    if (!call->receiver && strcmp(method, "report_duration") == 0 &&
+        call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE) {
+        pm_block_node_t *blk = (pm_block_node_t *)call->block;
+        if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+        free(method);
+        return;
+    }
+
+    /* raise "msg" or raise ClassName, "msg" */
+    if (!call->receiver && strcmp(method, "raise") == 0) {
+        int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
+        if (argc >= 2 && PM_NODE_TYPE(call->arguments->arguments.nodes[0]) == PM_CONSTANT_READ_NODE) {
+            /* raise ClassName, "message" */
+            pm_constant_read_node_t *cr = (pm_constant_read_node_t *)call->arguments->arguments.nodes[0];
+            char *cls = cstr(ctx, cr->name);
+            char *msg = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
+            emit(ctx, "sp_raise_cls(\"%s\", %s);\n", cls, msg);
+            free(cls); free(msg);
+        } else if (argc >= 1) {
+            char *msg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            emit(ctx, "sp_raise(%s);\n", msg);
+            free(msg);
+        } else {
+            emit(ctx, "sp_raise(\"RuntimeError\");\n");
+        }
+        free(method);
+        return;
+    }
+
+    /* throw :tag, value */
+    if (!call->receiver && strcmp(method, "throw") == 0 &&
+        call->arguments && call->arguments->arguments.size >= 1) {
+        pm_node_t *tag_node = call->arguments->arguments.nodes[0];
+        char *tag = codegen_expr(ctx, tag_node);
+        int argc = (int)call->arguments->arguments.size;
+        if (argc >= 2) {
+            pm_node_t *val_node = call->arguments->arguments.nodes[1];
+            vtype_t vt = infer_type(ctx, val_node);
+            char *val = codegen_expr(ctx, val_node);
+            if (vt.kind == SPINEL_TYPE_STRING)
+                emit(ctx, "sp_throw_s(%s, %s);\n", tag, val);
+            else
+                emit(ctx, "sp_throw_i(%s, %s);\n", tag, val);
+            free(val);
+        } else {
+            emit(ctx, "sp_throw_i(%s, 0);\n", tag);
+        }
+        free(tag); free(method);
+        return;
+    }
+
+    /* each_with_index on Array/StrArray → for loop with index (statement context) */
+    if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+        strcmp(method, "each_with_index") == 0 && call->receiver) {
+        vtype_t recv_t = infer_type(ctx, call->receiver);
+        if (recv_t.kind == SPINEL_TYPE_ARRAY || recv_t.kind == SPINEL_TYPE_STR_ARRAY) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *bpname = NULL, *bpidx = NULL;
+            if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
+                pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
+                if (bp->parameters && bp->parameters->requireds.size > 0) {
+                    pm_node_t *p = bp->parameters->requireds.nodes[0];
+                    if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                        bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+                }
+                if (bp->parameters && bp->parameters->requireds.size > 1) {
+                    pm_node_t *p = bp->parameters->requireds.nodes[1];
+                    if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                        bpidx = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+                }
+            }
+            int tmp = ctx->temp_counter++;
+            bool is_str = (recv_t.kind == SPINEL_TYPE_STR_ARRAY);
+            const char *len_fn = is_str ? "sp_StrArray_length" : "sp_IntArray_length";
+            emit(ctx, "for (mrb_int _ei_%d = 0; _ei_%d < %s(%s); _ei_%d++) {\n",
+                 tmp, tmp, len_fn, recv, tmp);
+            ctx->indent++;
+            if (bpname) {
+                char *cn = make_cname(bpname, false);
+                if (is_str)
+                    emit(ctx, "const char *%s = (%s)->data[_ei_%d];\n", cn, recv, tmp);
+                else
+                    emit(ctx, "mrb_int %s = sp_IntArray_get(%s, _ei_%d);\n", cn, recv, tmp);
+                free(cn);
+            }
+            if (bpidx) {
+                char *cn = make_cname(bpidx, false);
+                emit(ctx, "mrb_int %s = _ei_%d;\n", cn, tmp);
+                free(cn);
+            }
+            if (blk->body) {
+                bool saved_ir2 = ctx->implicit_return;
+                ctx->implicit_return = false;
+                codegen_stmts(ctx, (pm_node_t *)blk->body);
+                ctx->implicit_return = saved_ir2;
+            }
+            ctx->indent--;
+            emit(ctx, "}\n");
+            free(recv); free(bpname); free(bpidx); free(method);
+            return;
+        }
+    }
+
+    /* File.open(path, mode) do |f| ... end → sp_File open/close block */
+    if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+        strcmp(method, "open") == 0 && call->receiver &&
+        PM_NODE_TYPE(call->receiver) == PM_CONSTANT_READ_NODE) {
+        pm_constant_read_node_t *cr = (pm_constant_read_node_t *)call->receiver;
+        if (ceq(ctx, cr->name, "File") && call->arguments &&
+            call->arguments->arguments.size >= 1) {
+            ctx->needs_file_io = true;
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *path_arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            char *mode_arg = NULL;
+            if (call->arguments->arguments.size >= 2)
+                mode_arg = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
+            else
+                mode_arg = xstrdup("\"r\"");
+            /* Get block parameter name */
+            char *bpname = extract_block_param(ctx, blk);
+            char *cn = bpname ? make_cname(bpname, false) : xstrdup("_fio");
+            emit(ctx, "{\n");
+            ctx->indent++;
+            emit(ctx, "sp_File *%s = sp_File_open(%s, %s);\n", cn, path_arg, mode_arg);
+            /* Register block param as FILE type */
+            if (bpname)
+                var_declare(ctx, bpname, vt_prim(SPINEL_TYPE_FILE), false);
+            if (blk->body) {
+                bool saved_ir = ctx->implicit_return;
+                ctx->implicit_return = false;
+                codegen_stmts(ctx, (pm_node_t *)blk->body);
+                ctx->implicit_return = saved_ir;
+            }
+            emit(ctx, "sp_File_close(%s);\n", cn);
+            ctx->indent--;
+            emit(ctx, "}\n");
+            free(path_arg); free(mode_arg); free(bpname); free(cn); free(method);
+            return;
+        }
+    }
+
+    /* f.each_line do |line| ... end on FILE-typed receiver */
+    if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+        strcmp(method, "each_line") == 0 && call->receiver) {
+        vtype_t recv_t = infer_type(ctx, call->receiver);
+        if (recv_t.kind == SPINEL_TYPE_FILE) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *bpname = extract_block_param(ctx, blk);
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "{ char _buf_%d[4096];\n", tmp);
+            emit(ctx, "while (fgets(_buf_%d, sizeof(_buf_%d), %s->fp)) {\n", tmp, tmp, recv);
+            ctx->indent++;
+            emit(ctx, "size_t _len_%d = strlen(_buf_%d);\n", tmp, tmp);
+            emit(ctx, "if (_len_%d > 0 && _buf_%d[_len_%d-1] == '\\n') _buf_%d[_len_%d-1] = '\\0';\n",
+                 tmp, tmp, tmp, tmp, tmp);
+            if (bpname) {
+                char *cn = make_cname(bpname, false);
+                emit(ctx, "const char *%s = _buf_%d;\n", cn, tmp);
+                free(cn);
+            }
+            if (blk->body) {
+                bool saved_ir = ctx->implicit_return;
+                ctx->implicit_return = false;
+                codegen_stmts(ctx, (pm_node_t *)blk->body);
+                ctx->implicit_return = saved_ir;
+            }
+            ctx->indent--;
+            emit(ctx, "}\n");
+            emit(ctx, "}\n");
+            free(recv); free(bpname); free(method);
+            return;
+        }
+    }
+
+    /* f.puts / f.write / f.flock / f.seek / f.close on FILE-typed receiver (statement) */
+    if (call->receiver && (strcmp(method, "puts") == 0 || strcmp(method, "write") == 0 ||
+        strcmp(method, "flock") == 0 || strcmp(method, "seek") == 0 ||
+        strcmp(method, "close") == 0)) {
+        vtype_t recv_t = infer_type(ctx, call->receiver);
+        if (recv_t.kind == SPINEL_TYPE_FILE) {
+            char *recv = codegen_expr(ctx, call->receiver);
+            if (strcmp(method, "puts") == 0) {
+                if (call->arguments && call->arguments->arguments.size > 0) {
+                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    emit(ctx, "sp_File_puts(%s, %s);\n", recv, arg);
+                    free(arg);
+                } else {
+                    emit(ctx, "fputc('\\n', %s->fp);\n", recv);
+                }
+            } else if (strcmp(method, "write") == 0 && call->arguments &&
+                       call->arguments->arguments.size > 0) {
+                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                emit(ctx, "sp_File_write_str(%s, %s);\n", recv, arg);
+                free(arg);
+            } else if (strcmp(method, "flock") == 0 && call->arguments &&
+                       call->arguments->arguments.size > 0) {
+                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                emit(ctx, "flock(fileno(%s->fp), %s);\n", recv, arg);
+                free(arg);
+            } else if (strcmp(method, "seek") == 0 && call->arguments &&
+                       call->arguments->arguments.size > 0) {
+                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                emit(ctx, "fseek(%s->fp, (long)%s, SEEK_SET);\n", recv, arg);
+                free(arg);
+            } else if (strcmp(method, "close") == 0) {
+                emit(ctx, "sp_File_close(%s);\n", recv);
+            }
+            free(recv); free(method);
+            return;
+        }
+    }
+
+    /* String#each_char with block → iterate over characters */
+    if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+        strcmp(method, "each_char") == 0 && call->receiver) {
+        vtype_t recv_t = infer_type(ctx, call->receiver);
+        if (recv_t.kind == SPINEL_TYPE_STRING || recv_t.kind == SPINEL_TYPE_SP_STRING) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *bpname = extract_block_param(ctx, blk);
+            const char *cstr_expr = (recv_t.kind == SPINEL_TYPE_SP_STRING)
+                ? sfmt("sp_String_cstr(%s)", recv) : recv;
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "{ const char *_cs_%d = %s; mrb_int _cl_%d = (mrb_int)strlen(_cs_%d);\n",
+                 tmp, cstr_expr, tmp, tmp);
+            emit(ctx, "for (mrb_int _ci_%d = 0; _ci_%d < _cl_%d; _ci_%d++) {\n",
+                 tmp, tmp, tmp, tmp);
+            ctx->indent++;
+            if (bpname) {
+                char *cn = make_cname(bpname, false);
+                emit(ctx, "char _cbuf_%d[2] = { _cs_%d[_ci_%d], 0 };\n", tmp, tmp, tmp);
+                emit(ctx, "const char *%s = _cbuf_%d;\n", cn, tmp);
+                free(cn);
+            }
+            if (blk->body) {
+                bool saved_ir = ctx->implicit_return;
+                ctx->implicit_return = false;
+                codegen_stmts(ctx, (pm_node_t *)blk->body);
+                ctx->implicit_return = saved_ir;
+            }
+            ctx->indent--;
+            emit(ctx, "} }\n");
+            if (recv_t.kind == SPINEL_TYPE_SP_STRING) free((char *)cstr_expr);
+            free(recv); free(bpname); free(method);
+            return;
+        }
+    }
+
+    /* String#each_line with block → split by newline and iterate */
+    if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+        strcmp(method, "each_line") == 0 && call->receiver) {
+        vtype_t recv_t = infer_type(ctx, call->receiver);
+        if (recv_t.kind == SPINEL_TYPE_STRING) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *bpname = extract_block_param(ctx, blk);
+            ctx->needs_str_split = true;
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "{ sp_StrArray *_lines_%d = sp_str_split(%s, \"\\n\");\n", tmp, recv);
+            emit(ctx, "for (mrb_int _li_%d = 0; _li_%d < sp_StrArray_length(_lines_%d); _li_%d++) {\n",
+                 tmp, tmp, tmp, tmp);
+            ctx->indent++;
+            if (bpname) {
+                char *cn = make_cname(bpname, false);
+                emit(ctx, "const char *%s = _lines_%d->data[_li_%d];\n", cn, tmp, tmp);
+                free(cn);
+            }
+            if (blk->body) {
+                bool saved_ir2 = ctx->implicit_return;
+                ctx->implicit_return = false;
+                codegen_stmts(ctx, (pm_node_t *)blk->body);
+                ctx->implicit_return = saved_ir2;
+            }
+            ctx->indent--;
+            emit(ctx, "}\n");
+            emit(ctx, "}\n");
+            free(recv); free(bpname); free(method);
+            return;
+        }
+    }
+
+    /* Array#each with block → inline for loop (statement context) */
+    if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+        strcmp(method, "each") == 0 && call->receiver) {
+        vtype_t recv_t = infer_type(ctx, call->receiver);
+        if (recv_t.kind == SPINEL_TYPE_ARRAY) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *bpname = extract_block_param(ctx, blk);
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "for (mrb_int _ei_%d = 0; _ei_%d < sp_IntArray_length(%s); _ei_%d++) {\n",
+                 tmp, tmp, recv, tmp);
+            ctx->indent++;
+            if (bpname) {
+                char *cn = make_cname(bpname, false);
+                emit(ctx, "mrb_int %s = sp_IntArray_get(%s, _ei_%d);\n", cn, recv, tmp);
+                free(cn);
+            }
+            if (blk->body) {
+                bool saved_ir2 = ctx->implicit_return;
+                ctx->implicit_return = false;
+                codegen_stmts(ctx, (pm_node_t *)blk->body);
+                ctx->implicit_return = saved_ir2;
+            }
+            ctx->indent--;
+            emit(ctx, "}\n");
+            free(recv); free(bpname); free(method);
+            return;
+        }
+
+        /* sp_RbArray#each with block → inline for loop with sp_RbValue elements */
+        if (recv_t.kind == SPINEL_TYPE_RB_ARRAY) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *bpname = extract_block_param(ctx, blk);
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "for (mrb_int _ei_%d = 0; _ei_%d < sp_RbArray_length(%s); _ei_%d++) {\n",
+                 tmp, tmp, recv, tmp);
+            ctx->indent++;
+            /* Temporarily override the block param type to POLY */
+            int saved_vc = ctx->var_count;
+            vtype_t saved_type = {0};
+            var_entry_t *existing_v = bpname ? var_lookup(ctx, bpname) : NULL;
+            if (existing_v) {
+                saved_type = existing_v->type;
+                existing_v->type = vt_prim(SPINEL_TYPE_POLY);
+            } else if (bpname) {
+                /* Force-add a new POLY entry at the end */
+                assert(ctx->var_count < MAX_VARS);
+                var_entry_t *nv = &ctx->vars[ctx->var_count++];
+                snprintf(nv->name, sizeof(nv->name), "%s", bpname);
+                nv->type = vt_prim(SPINEL_TYPE_POLY);
+                nv->declared = false;
+                nv->is_constant = false;
+            }
+            if (bpname) {
+                char *cn = make_cname(bpname, false);
+                emit(ctx, "sp_RbValue %s = sp_RbArray_get(%s, _ei_%d);\n", cn, recv, tmp);
+                free(cn);
+            }
+            if (blk->body) {
+                bool saved_ir2 = ctx->implicit_return;
+                ctx->implicit_return = false;
+                codegen_stmts(ctx, (pm_node_t *)blk->body);
+                ctx->implicit_return = saved_ir2;
+            }
+            /* Restore var table */
+            if (existing_v) {
+                existing_v->type = saved_type;
+            } else {
+                ctx->var_count = saved_vc;
+            }
+            ctx->indent--;
+            emit(ctx, "}\n");
+            free(recv); free(bpname); free(method);
+            return;
+        }
+
+        /* Range#each with block |i| → inline for loop */
+        if (recv_t.kind == SPINEL_TYPE_RANGE) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *bpname = extract_block_param(ctx, blk);
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "{ sp_Range _rng_%d = %s;\n", tmp, recv);
+            if (bpname) {
+                char *cn = make_cname(bpname, false);
+                emit(ctx, "for (mrb_int %s = _rng_%d.first; %s <= _rng_%d.last; %s++) {\n",
+                     cn, tmp, cn, tmp, cn);
+                free(cn);
+            } else {
+                emit(ctx, "for (mrb_int _ri_%d = _rng_%d.first; _ri_%d <= _rng_%d.last; _ri_%d++) {\n",
+                     tmp, tmp, tmp, tmp, tmp);
+            }
+            ctx->indent++;
+            if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+            ctx->indent--;
+            emit(ctx, "}\n");
+            emit(ctx, "}\n");
+            free(recv); free(bpname); free(method);
+            return;
+        }
+
+        /* sp_StrArray#each with block → inline for loop with string elements */
+        if (recv_t.kind == SPINEL_TYPE_STR_ARRAY) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *bpname = extract_block_param(ctx, blk);
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "for (mrb_int _ei_%d = 0; _ei_%d < sp_StrArray_length(%s); _ei_%d++) {\n",
+                 tmp, tmp, recv, tmp);
+            ctx->indent++;
+            if (bpname) {
+                char *cn = make_cname(bpname, false);
+                emit(ctx, "const char *%s = (%s)->data[_ei_%d];\n", cn, recv, tmp);
+                free(cn);
+            }
+            if (blk->body) {
+                bool saved_ir2 = ctx->implicit_return;
+                ctx->implicit_return = false;
+                codegen_stmts(ctx, (pm_node_t *)blk->body);
+                ctx->implicit_return = saved_ir2;
+            }
+            ctx->indent--;
+            emit(ctx, "}\n");
+            free(recv); free(bpname); free(method);
+            return;
+        }
+
+        /* Object method with block → generate block callback and pass to method */
+        if (recv_t.kind == SPINEL_TYPE_OBJECT) {
+            class_info_t *rcls = find_class(ctx, recv_t.klass);
+            if (rcls) {
+                class_info_t *owner = NULL;
+                method_info_t *target = find_method_inherited(ctx, rcls, method, &owner);
+                if (target && target->body_node && has_yield_nodes(target->body_node)) {
+                    pm_block_node_t *blk = (pm_block_node_t *)call->block;
+                    char *recv = codegen_expr(ctx, call->receiver);
+
+                    /* Detect non-local return in block body */
+                    bool has_nonlocal_return = blk->body && block_has_return((pm_node_t *)blk->body);
+
+                    /* Extract block parameter name */
+                    char *bpname = NULL;
+                    if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
+                        pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
+                        if (bp->parameters && bp->parameters->requireds.size > 0) {
+                            pm_node_t *p = bp->parameters->requireds.nodes[0];
+                            if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                                bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+                        }
+                    }
+
+                    /* Scan captures: variables used in block body (excluding block param) */
+                    capture_list_t local_defs = {.count = 0};
+                    capture_list_t captures = {.count = 0};
+                    scan_captures(ctx, (pm_node_t *)blk->body,
+                                  bpname ? bpname : "", &local_defs, &captures);
+
+                    /* Generate block callback (written to block_out) */
+                    int blk_id = ctx->block_counter++;
+                    FILE *saved_out = ctx->out;
+                    if (ctx->block_out) ctx->out = ctx->block_out;
+
+                    /* Env struct: captured scalars by pointer */
+                    emit_raw(ctx, "typedef struct { ");
+                    for (int ci = 0; ci < captures.count; ci++) {
+                        var_entry_t *v = var_lookup(ctx, captures.names[ci]);
+                        if (!v) continue;
+                        char *cn = make_cname(v->name, false);
+                        emit_raw(ctx, "mrb_int *%s; ", cn);
+                        free(cn);
+                    }
+                    if (has_nonlocal_return) {
+                        emit_raw(ctx, "volatile mrb_int *_blk_ret_val; int _blk_ret_depth; ");
+                    }
+                    if (captures.count == 0 && !has_nonlocal_return) emit_raw(ctx, "int _dummy; ");
+                    emit_raw(ctx, "} _blk_env_%d_t;\n", blk_id);
+
+                    emit_raw(ctx, "static mrb_int _blk_%d(void *_e, mrb_int _arg) {\n", blk_id);
+                    emit_raw(ctx, "    _blk_env_%d_t *_env = (_blk_env_%d_t *)_e;\n", blk_id, blk_id);
+
+                    /* Block parameter from _arg */
+                    if (bpname) {
+                        char *cn = make_cname(bpname, false);
+                        emit_raw(ctx, "    mrb_int %s = _arg;\n", cn);
+                        free(cn);
+                    }
+
+                    /* Alias captured variables: #define lv_total (*_env->lv_total) */
+                    for (int ci = 0; ci < captures.count; ci++) {
+                        var_entry_t *v = var_lookup(ctx, captures.names[ci]);
+                        if (!v) continue;
+                        char *cn = make_cname(v->name, false);
+                        emit_raw(ctx, "    #define %s (*_env->%s)\n", cn, cn);
+                        free(cn);
+                    }
+
+                    /* For non-local return, alias _e for the return macros */
+                    if (has_nonlocal_return) {
+                        emit_raw(ctx, "    #define _e _env\n");
+                    }
+
+                    /* Generate block body */
+                    int saved_indent = ctx->indent;
+                    ctx->indent = 1;
+                    bool saved_in_block_nonlocal = ctx->in_block_nonlocal;
+                    int saved_block_return_id = ctx->block_return_id;
+                    if (has_nonlocal_return) {
+                        ctx->in_block_nonlocal = true;
+                        ctx->block_return_id = blk_id;
+                    }
+                    if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+                    ctx->in_block_nonlocal = saved_in_block_nonlocal;
+                    ctx->block_return_id = saved_block_return_id;
+                    ctx->indent = saved_indent;
+
+                    if (has_nonlocal_return) {
+                        emit_raw(ctx, "    #undef _e\n");
+                    }
+
+                    /* Undefine aliases */
+                    for (int ci = 0; ci < captures.count; ci++) {
+                        var_entry_t *v = var_lookup(ctx, captures.names[ci]);
+                        if (!v) continue;
+                        char *cn = make_cname(v->name, false);
+                        emit_raw(ctx, "    #undef %s\n", cn);
+                        free(cn);
+                    }
+
+                    emit_raw(ctx, "    return 0;\n");
+                    emit_raw(ctx, "}\n");
+
+                    ctx->out = saved_out;
+
+                    if (has_nonlocal_return) {
+                        /* Non-local return: wrap call with setjmp/longjmp */
+                        emit(ctx, "{ volatile mrb_int _blk_ret_val_%d = 0;\n", blk_id);
+                        emit(ctx, "sp_exc_depth++;\n");
+                        emit(ctx, "_blk_env_%d_t _env_%d;\n", blk_id, blk_id);
+                        for (int ci = 0; ci < captures.count; ci++) {
+                            var_entry_t *v = var_lookup(ctx, captures.names[ci]);
+                            if (!v) continue;
+                            char *cn = make_cname(v->name, false);
+                            emit(ctx, "_env_%d.%s = &%s;\n", blk_id, cn, cn);
+                            free(cn);
+                        }
+                        emit(ctx, "_env_%d._blk_ret_val = &_blk_ret_val_%d;\n", blk_id, blk_id);
+                        emit(ctx, "_env_%d._blk_ret_depth = sp_exc_depth - 1;\n", blk_id);
+
+                        const char *c_mname = sanitize_method(method);
+                        class_info_t *def_cls = owner ? owner : rcls;
+
+                        emit(ctx, "if (setjmp(sp_exc_stack[sp_exc_depth - 1]) == 0) {\n");
+                        ctx->indent++;
+                        emit(ctx, "sp_%s_%s(%s, (sp_block_fn)_blk_%d, &_env_%d);\n",
+                             def_cls->name, c_mname, recv, blk_id, blk_id);
+                        emit(ctx, "sp_exc_depth--;\n");
+                        ctx->indent--;
+                        emit(ctx, "} else {\n");
+                        ctx->indent++;
+                        emit(ctx, "sp_exc_depth--;\n");
+                        emit(ctx, "return _blk_ret_val_%d;\n", blk_id);
+                        ctx->indent--;
+                        emit(ctx, "}\n");
+                        emit(ctx, "}\n");
+                    } else {
+                        /* Set up the environment struct */
+                        emit(ctx, "{ _blk_env_%d_t _env_%d;\n", blk_id, blk_id);
+                        for (int ci = 0; ci < captures.count; ci++) {
+                            var_entry_t *v = var_lookup(ctx, captures.names[ci]);
+                            if (!v) continue;
+                            char *cn = make_cname(v->name, false);
+                            emit(ctx, "_env_%d.%s = &%s;\n", blk_id, cn, cn);
+                            free(cn);
+                        }
+
+                        /* Call the method with block */
+                        const char *c_mname = sanitize_method(method);
+                        class_info_t *def_cls = owner ? owner : rcls;
+                        emit(ctx, "sp_%s_%s(%s, (sp_block_fn)_blk_%d, &_env_%d);\n",
+                             def_cls->name, c_mname, recv, blk_id, blk_id);
+                        emit(ctx, "}\n");
+                    }
+
+                    free(recv); free(bpname); free(method);
+                    return;
+                }
+            }
+        }
+
+        /* sp_RbHash#each with block |k, v| → inline loop (k=string, v=sp_RbValue) */
+        if (recv_t.kind == SPINEL_TYPE_RB_HASH) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *kname = NULL, *vname = NULL;
+            if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
+                pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
+                if (bp->parameters && bp->parameters->requireds.size > 0) {
+                    pm_node_t *p = bp->parameters->requireds.nodes[0];
+                    if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                        kname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+                }
+                if (bp->parameters && bp->parameters->requireds.size > 1) {
+                    pm_node_t *p = bp->parameters->requireds.nodes[1];
+                    if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                        vname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+                }
+            }
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "for (sp_RbHashEntry *_rhe_%d = %s->first; _rhe_%d; _rhe_%d = _rhe_%d->order_next) {\n",
+                 tmp, recv, tmp, tmp, tmp);
+            ctx->indent++;
+            if (kname) {
+                char *cn = make_cname(kname, false);
+                emit(ctx, "%s = _rhe_%d->key;\n", cn, tmp);
+                free(cn);
+            }
+            if (vname) {
+                char *cn = make_cname(vname, false);
+                emit(ctx, "%s = _rhe_%d->value;\n", cn, tmp);
+                free(cn);
+            }
+            if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+            ctx->indent--;
+            emit(ctx, "}\n");
+            free(recv); free(kname); free(vname); free(method);
+            return;
+        }
+
+        /* Hash#each with block |k, v| → inline loop over insertion-order list */
+        if (recv_t.kind == SPINEL_TYPE_HASH) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *kname = NULL, *vname = NULL;
+            if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
+                pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
+                if (bp->parameters && bp->parameters->requireds.size > 0) {
+                    pm_node_t *p = bp->parameters->requireds.nodes[0];
+                    if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                        kname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+                }
+                if (bp->parameters && bp->parameters->requireds.size > 1) {
+                    pm_node_t *p = bp->parameters->requireds.nodes[1];
+                    if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                        vname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+                }
+            }
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "for (sp_HashEntry *_he_%d = %s->first; _he_%d; _he_%d = _he_%d->order_next) {\n",
+                 tmp, recv, tmp, tmp, tmp);
+            ctx->indent++;
+            if (kname) {
+                char *cn = make_cname(kname, false);
+                emit(ctx, "%s = _he_%d->key;\n", cn, tmp);
+                free(cn);
+            }
+            if (vname) {
+                char *cn = make_cname(vname, false);
+                emit(ctx, "%s = _he_%d->value;\n", cn, tmp);
+                free(cn);
+            }
+            if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+            ctx->indent--;
+            emit(ctx, "}\n");
+            free(recv); free(kname); free(vname); free(method);
+            return;
+        }
+    }
+
+    /* String#scan(regexp) { |m| ... } → inline loop with onig_search */
+    if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+        strcmp(method, "scan") == 0 && call->receiver &&
+        call->arguments && call->arguments->arguments.size == 1) {
+        vtype_t recv_t = infer_type(ctx, call->receiver);
+        vtype_t arg_t = infer_type(ctx, call->arguments->arguments.nodes[0]);
+        if (recv_t.kind == SPINEL_TYPE_STRING && arg_t.kind == SPINEL_TYPE_REGEXP) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *pat = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            char *bpname = extract_block_param(ctx, blk);
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "{ /* scan */\n");
+            ctx->indent++;
+            emit(ctx, "const char *_ss_%d = %s;\n", tmp, recv);
+            emit(ctx, "OnigRegion *_sr_%d = onig_region_new();\n", tmp);
+            emit(ctx, "const OnigUChar *_se_%d = (const OnigUChar *)_ss_%d + strlen(_ss_%d);\n", tmp, tmp, tmp);
+            emit(ctx, "int _sp_%d = 0;\n", tmp);
+            emit(ctx, "while (_sp_%d >= 0) {\n", tmp);
+            ctx->indent++;
+            emit(ctx, "_sp_%d = onig_search(%s, (const OnigUChar *)_ss_%d, _se_%d,\n", tmp, pat, tmp, tmp);
+            emit(ctx, "    (const OnigUChar *)_ss_%d + _sp_%d, _se_%d, _sr_%d, ONIG_OPTION_NONE);\n", tmp, tmp, tmp, tmp);
+            emit(ctx, "if (_sp_%d >= 0) {\n", tmp);
+            ctx->indent++;
+            if (bpname) {
+                char *cn = make_cname(bpname, false);
+                emit(ctx, "int _ml_%d = _sr_%d->end[0] - _sr_%d->beg[0];\n", tmp, tmp, tmp);
+                emit(ctx, "char *%s = (char *)malloc(_ml_%d + 1);\n", cn, tmp);
+                emit(ctx, "memcpy(%s, _ss_%d + _sr_%d->beg[0], _ml_%d);\n", cn, tmp, tmp, tmp);
+                emit(ctx, "%s[_ml_%d] = '\\0';\n", cn, tmp);
+                free(cn);
+            }
+            if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+            emit(ctx, "_sp_%d = _sr_%d->end[0];\n", tmp, tmp);
+            ctx->indent--;
+            emit(ctx, "}\n");
+            ctx->indent--;
+            emit(ctx, "}\n");
+            emit(ctx, "onig_region_free(_sr_%d, 1);\n", tmp);
+            ctx->indent--;
+            emit(ctx, "}\n");
+            free(recv); free(pat); free(bpname); free(method);
+            return;
+        }
+    }
+
+    /* Receiver-less call with block to yield function → generate callback */
+    if (!call->receiver && call->block &&
+        PM_NODE_TYPE(call->block) == PM_BLOCK_NODE) {
+        func_info_t *fn = find_func(ctx, method);
+        if (fn && fn->has_yield) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            int blk_id = ctx->block_counter++;
+
+            /* Detect non-local return in block body */
+            bool has_nonlocal_return = blk->body && block_has_return((pm_node_t *)blk->body);
+
+            /* Get block parameter name */
+            char *bpname = extract_block_param(ctx, blk);
+
+            /* Scan block body for captured variables (variables from the caller's scope) */
+            capture_list_t local_defs = {.count = 0};
+            capture_list_t captures = {.count = 0};
+            scan_captures(ctx, (pm_node_t *)blk->body,
+                          bpname ? bpname : "", &local_defs, &captures);
+
+            /* Generate the block body first (to a temp buffer). Any nested blocks
+             * will be written to ctx->block_out during body generation, so they
+             * appear BEFORE this block in the output (correct C ordering). */
+            int saved_indent = ctx->indent;
+            int saved_var_count = ctx->var_count;
+            ctx->indent = 1;
+
+            /* Register block param in var table */
+            if (bpname)
+                var_declare(ctx, bpname, vt_prim(SPINEL_TYPE_INTEGER), false);
+
+            char *body_processed = NULL;
+            {
+                char *body_buf_data = NULL;
+                size_t body_buf_size = 0;
+                FILE *body_buf = open_memstream(&body_buf_data, &body_buf_size);
+                FILE *saved_out = ctx->out;
+                ctx->out = body_buf;
+
+                /* Set non-local return context if block has return */
+                bool saved_in_block_nonlocal = ctx->in_block_nonlocal;
+                int saved_block_return_id = ctx->block_return_id;
+                if (has_nonlocal_return) {
+                    ctx->in_block_nonlocal = true;
+                    ctx->block_return_id = blk_id;
+                }
+
+                if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+
+                ctx->in_block_nonlocal = saved_in_block_nonlocal;
+                ctx->block_return_id = saved_block_return_id;
+
+                fclose(body_buf);
+                ctx->out = saved_out;
+
+                /* Replace lv_CAPNAME with (*_e->CAPNAME) for captured vars */
+                if (body_buf_data) {
+                    body_processed = xstrdup(body_buf_data);
+                    for (int i = 0; i < captures.count; i++) {
+                        char *old_ref = sfmt("lv_%s", captures.names[i]);
+                        char *new_ref = sfmt("(*_e->%s)", captures.names[i]);
+                        while (1) {
+                            char *pos = strstr(body_processed, old_ref);
+                            if (!pos) break;
+                            size_t prefix_len = pos - body_processed;
+                            size_t old_len = strlen(old_ref);
+                            size_t new_len = strlen(new_ref);
+                            size_t rest_len = strlen(pos + old_len);
+                            char *nr = malloc(prefix_len + new_len + rest_len + 1);
+                            memcpy(nr, body_processed, prefix_len);
+                            memcpy(nr + prefix_len, new_ref, new_len);
+                            memcpy(nr + prefix_len + new_len, pos + old_len, rest_len + 1);
+                            free(body_processed);
+                            body_processed = nr;
+                        }
+                        free(old_ref); free(new_ref);
+                    }
+                    free(body_buf_data);
+                }
+            }
+
+            ctx->indent = saved_indent;
+            ctx->var_count = saved_var_count;
+
+            /* Now write the complete block function to block_out.
+             * At this point, any nested blocks have already been written to
+             * block_out, so they appear before this block (correct for C). */
+            if (ctx->block_out) {
+                /* Env struct */
+                fprintf(ctx->block_out, "typedef struct { ");
+                for (int i = 0; i < captures.count; i++)
+                    fprintf(ctx->block_out, "mrb_int *%s; ", captures.names[i]);
+                if (has_nonlocal_return) {
+                    fprintf(ctx->block_out, "volatile mrb_int *_blk_ret_val; int _blk_ret_depth; ");
+                }
+                if (captures.count == 0 && !has_nonlocal_return) fprintf(ctx->block_out, "int _dummy; ");
+                fprintf(ctx->block_out, "} _blk_%d_env;\n", blk_id);
+
+                /* Callback function */
+                fprintf(ctx->block_out, "static mrb_int _blk_%d(void *_env, mrb_int _arg) {\n", blk_id);
+                fprintf(ctx->block_out, "    _blk_%d_env *_e = (_blk_%d_env *)_env;\n", blk_id, blk_id);
+                if (bpname) {
+                    char *cn = make_cname(bpname, false);
+                    fprintf(ctx->block_out, "    mrb_int %s = _arg;\n", cn);
+                    free(cn);
+                }
+                if (body_processed) {
+                    fprintf(ctx->block_out, "%s", body_processed);
+                }
+                fprintf(ctx->block_out, "    return 0;\n");
+                fprintf(ctx->block_out, "}\n\n");
+            }
+            free(body_processed);
+
+            /* Generate the call site: env init + function call */
+            if (has_nonlocal_return) {
+                /* Non-local return: wrap call with setjmp/longjmp */
+                emit(ctx, "{ volatile mrb_int _blk_ret_val_%d = 0;\n", blk_id);
+                emit(ctx, "sp_exc_depth++;\n");
+                emit(ctx, "_blk_%d_env _env_%d = { ", blk_id, blk_id);
+                for (int i = 0; i < captures.count; i++) {
+                    char *cn = make_cname(captures.names[i], false);
+                    emit_raw(ctx, "&%s, ", cn);
+                    free(cn);
+                }
+                emit_raw(ctx, "&_blk_ret_val_%d, sp_exc_depth - 1 };\n", blk_id);
+
+                emit(ctx, "if (setjmp(sp_exc_stack[sp_exc_depth - 1]) == 0) {\n");
+                ctx->indent++;
+
+                /* Build arguments */
+                int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
+                char *args = xstrdup("");
+                for (int i = 0; i < argc; i++) {
+                    char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
+                    char *na = sfmt("%s%s%s", args, i > 0 ? ", " : "", a);
+                    free(args); free(a);
+                    args = na;
+                }
+                emit(ctx, "sp_%s(%s%s(sp_block_fn)_blk_%d, &_env_%d);\n",
+                     fn->name, args, argc > 0 ? ", " : "", blk_id, blk_id);
+                emit(ctx, "sp_exc_depth--;\n");
+                free(args);
+
+                ctx->indent--;
+                emit(ctx, "} else {\n");
+                ctx->indent++;
+                emit(ctx, "sp_exc_depth--;\n");
+                emit(ctx, "return _blk_ret_val_%d;\n", blk_id);
+                ctx->indent--;
+                emit(ctx, "}\n");
+                emit(ctx, "}\n");
+            } else {
+                emit(ctx, "_blk_%d_env _env_%d = { ", blk_id, blk_id);
+                for (int i = 0; i < captures.count; i++) {
+                    char *cn = make_cname(captures.names[i], false);
+                    emit_raw(ctx, "%s&%s", i > 0 ? ", " : "", cn);
+                    free(cn);
+                }
+                if (captures.count == 0) emit_raw(ctx, "0");
+                emit_raw(ctx, " };\n");
+
+                /* Build arguments */
+                int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
+                char *args = xstrdup("");
+                for (int i = 0; i < argc; i++) {
+                    char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
+                    char *na = sfmt("%s%s%s", args, i > 0 ? ", " : "", a);
+                    free(args); free(a);
+                    args = na;
+                }
+                emit(ctx, "sp_%s(%s%s(sp_block_fn)_blk_%d, &_env_%d);\n",
+                     fn->name, args, argc > 0 ? ", " : "", blk_id, blk_id);
+                free(args);
+            }
+            free(bpname); free(method);
+            return;
+        }
+    }
+
+    /* Integer#times with block → for loop */
+    if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+        strcmp(method, "times") == 0) {
+        pm_block_node_t *blk = (pm_block_node_t *)call->block;
+        char *count = codegen_expr(ctx, call->receiver);
+
+        /* Get block parameter name */
+        char *bpname = NULL;
+        if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
+            pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
+            if (bp->parameters && bp->parameters->requireds.size > 0) {
+                pm_node_t *p = bp->parameters->requireds.nodes[0];
+                if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                    bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+            }
+        }
+
+        if (bpname) {
+            char *cn = make_cname(bpname, false);
+            emit(ctx, "for (%s = 0; %s < %s; %s++) {\n", cn, cn, count, cn);
+            free(cn); free(bpname);
+        } else {
+            int tmp = ctx->temp_counter++;
+            emit(ctx, "for (mrb_int _it%d = 0; _it%d < %s; _it%d++) {\n",
+                 tmp, tmp, count, tmp);
+        }
+        free(count);
+
+        ctx->indent++;
+        ctx->for_depth++;
+        if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+        ctx->for_depth--;
+        ctx->indent--;
+        emit(ctx, "}\n");
+        free(method);
+        return;
+    }
+
+    /* Integer#upto/downto with block → for loop */
+    if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+        (strcmp(method, "upto") == 0 || strcmp(method, "downto") == 0) &&
+        call->arguments && call->arguments->arguments.size == 1) {
+        pm_block_node_t *blk = (pm_block_node_t *)call->block;
+        char *start = codegen_expr(ctx, call->receiver);
+        char *end = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+        bool is_upto = strcmp(method, "upto") == 0;
+
+        char *bpname = NULL;
+        if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
+            pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
+            if (bp->parameters && bp->parameters->requireds.size > 0) {
+                pm_node_t *p = bp->parameters->requireds.nodes[0];
+                if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                    bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+            }
+        }
+        if (bpname) {
+            char *cn = make_cname(bpname, false);
+            if (is_upto)
+                emit(ctx, "for (%s = %s; %s <= %s; %s++) {\n", cn, start, cn, end, cn);
+            else
+                emit(ctx, "for (%s = %s; %s >= %s; %s--) {\n", cn, start, cn, end, cn);
+            free(cn); free(bpname);
+        } else {
+            int tmp = ctx->temp_counter++;
+            if (is_upto)
+                emit(ctx, "for (mrb_int _it%d = %s; _it%d <= %s; _it%d++) {\n", tmp, start, tmp, end, tmp);
+            else
+                emit(ctx, "for (mrb_int _it%d = %s; _it%d >= %s; _it%d--) {\n", tmp, start, tmp, end, tmp);
+        }
+        free(start); free(end);
+        ctx->indent++;
+        ctx->for_depth++;
+        if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+        ctx->for_depth--;
+        ctx->indent--;
+        emit(ctx, "}\n");
+        free(method);
+        return;
+    }
+
+    /* sp_String replace/clear as statement */
+    if (call->receiver && PM_NODE_TYPE(call->receiver) == PM_LOCAL_VARIABLE_READ_NODE) {
+        vtype_t recv_t = infer_type(ctx, call->receiver);
+        if (recv_t.kind == SPINEL_TYPE_SP_STRING) {
+            if (strcmp(method, "replace") == 0 && call->arguments &&
+                call->arguments->arguments.size == 1) {
+                pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
+                char *vn = cstr(ctx, lv->name);
+                char *cn = make_cname(vn, false);
+                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                emit(ctx, "sp_String_replace(%s, %s);\n", cn, arg);
+                free(vn); free(cn); free(arg); free(method);
+                return;
+            }
+            if (strcmp(method, "clear") == 0) {
+                pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
+                char *vn = cstr(ctx, lv->name);
+                char *cn = make_cname(vn, false);
+                emit(ctx, "sp_String_clear(%s);\n", cn);
+                free(vn); free(cn); free(method);
+                return;
+            }
+        }
+    }
+
+    /* String << (append) as statement */
+    if (call->receiver && strcmp(method, "<<") == 0 &&
+        call->arguments && call->arguments->arguments.size == 1) {
+        vtype_t recv_t = infer_type(ctx, call->receiver);
+        if (PM_NODE_TYPE(call->receiver) == PM_LOCAL_VARIABLE_READ_NODE) {
+            if (recv_t.kind == SPINEL_TYPE_SP_STRING) {
+                /* Mutable string: sp_String_append(s, arg) */
+                pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
+                char *vn = cstr(ctx, lv->name);
+                char *cn = make_cname(vn, false);
+                pm_node_t *arg_node = call->arguments->arguments.nodes[0];
+                vtype_t arg_t = infer_type(ctx, arg_node);
+                char *arg = codegen_expr(ctx, arg_node);
+                if (arg_t.kind == SPINEL_TYPE_SP_STRING)
+                    emit(ctx, "sp_String_append_str(%s, %s);\n", cn, arg);
+                else if (arg_t.kind == SPINEL_TYPE_INTEGER)
+                    emit(ctx, "sp_String_append(%s, sp_int_to_s(%s));\n", cn, arg);
+                else
+                    emit(ctx, "sp_String_append(%s, %s);\n", cn, arg);
+                free(vn); free(cn); free(arg); free(method);
+                return;
+            }
+            if (recv_t.kind == SPINEL_TYPE_STRING) {
+                /* Immutable string: reassign with concat */
+                pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
+                char *vn = cstr(ctx, lv->name);
+                char *cn = make_cname(vn, false);
+                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                emit(ctx, "%s = sp_str_concat(%s, %s);\n", cn, cn, arg);
+                free(vn); free(cn); free(arg); free(method);
+                return;
+            }
+        }
+        if (recv_t.kind == SPINEL_TYPE_ARRAY) {
+            /* IntArray << val → sp_IntArray_push(arr, val) */
+            char *recv = codegen_expr(ctx, call->receiver);
+            char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+            emit(ctx, "sp_IntArray_push(%s, %s);\n", recv, arg);
+            free(recv); free(arg); free(method);
+            return;
+        }
+    }
+
+    /* receiver.puts / receiver.print on non-FILE (unknown/VALUE) → fallback to stdout */
+    if (call->receiver && (strcmp(method, "puts") == 0 || strcmp(method, "print") == 0)) {
+        vtype_t recv_t = infer_type(ctx, call->receiver);
+        if (recv_t.kind == SPINEL_TYPE_VALUE || recv_t.kind == SPINEL_TYPE_UNKNOWN) {
+            bool is_puts = strcmp(method, "puts") == 0;
+            if (call->arguments && call->arguments->arguments.size > 0) {
+                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                if (is_puts)
+                    emit(ctx, "fprintf(stdout, \"%%s\\n\", %s);\n", arg);
+                else
+                    emit(ctx, "fprintf(stdout, \"%%s\", %s);\n", arg);
+                free(arg);
+            } else {
+                if (is_puts)
+                    emit(ctx, "fputc('\\n', stdout);\n");
+                /* print with no args is a no-op */
+            }
+            free(method);
+            return;
+        }
+    }
+
+    /* General call as statement */
+    {
+        char *expr = codegen_expr(ctx, node);
+        emit(ctx, "%s;\n", expr);
+        free(expr); free(method);
+    }
+    return;
+}
+
 void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
     if (!node) return;
 
@@ -531,1425 +1957,10 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
         break;
     }
 
-    case PM_CALL_NODE: {
-        pm_call_node_t *call = (pm_call_node_t *)node;
-
-        /* require/require_relative are compile-time directives — skip at codegen */
-        if (is_require_relative(ctx, node) || is_require(ctx, node))
-            break;
-
-        /* private/protected/public/extend — access modifiers and runtime
-         * mixin operations are no-ops in AOT */
-        {
-            char *_mname = cstr(ctx, call->name);
-            if (!call->receiver &&
-                (strcmp(_mname, "private") == 0 ||
-                 strcmp(_mname, "protected") == 0 ||
-                 strcmp(_mname, "public") == 0 ||
-                 strcmp(_mname, "extend") == 0 ||
-                 strcmp(_mname, "define_method") == 0)) {
-                free(_mname);
-                break;
-            }
-            free(_mname);
-        }
-
-        /* print int.chr → putchar */
-        if (!call->receiver && try_print_chr(ctx, call))
-            break;
-
-        char *method = cstr(ctx, call->name);
-
-        /* $stderr.puts / $stdout.puts */
-        if (call->receiver && PM_NODE_TYPE(call->receiver) == PM_GLOBAL_VARIABLE_READ_NODE &&
-            strcmp(method, "puts") == 0) {
-            pm_global_variable_read_node_t *gv = (pm_global_variable_read_node_t *)call->receiver;
-            char *gname = cstr(ctx, gv->name);
-            const char *stream = strcmp(gname, "$stderr") == 0 ? "stderr" : "stdout";
-            if (call->arguments && call->arguments->arguments.size > 0) {
-                char *ae = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                emit(ctx, "fprintf(%s, \"%%s\\n\", %s);\n", stream, ae);
-                free(ae);
-            } else {
-                emit(ctx, "fputc('\\n', %s);\n", stream);
-            }
-            free(gname); free(method);
-            break;
-        }
-
-        /* Kernel#exit — also handle exit(true)→0, exit(false)→1 */
-        if (!call->receiver && strcmp(method, "exit") == 0) {
-            if (call->arguments && call->arguments->arguments.size > 0) {
-                pm_node_t *arg0 = call->arguments->arguments.nodes[0];
-                if (PM_NODE_TYPE(arg0) == PM_TRUE_NODE) {
-                    emit(ctx, "exit(0);\n");
-                } else if (PM_NODE_TYPE(arg0) == PM_FALSE_NODE) {
-                    emit(ctx, "exit(1);\n");
-                } else {
-                    char *code = codegen_expr(ctx, arg0);
-                    emit(ctx, "exit((int)%s);\n", code);
-                    free(code);
-                }
-            } else {
-                emit(ctx, "exit(0);\n");
-            }
-            free(method);
-            break;
-        }
-
-        /* Kernel#abort */
-        if (!call->receiver && strcmp(method, "abort") == 0) {
-            if (call->arguments && call->arguments->arguments.size > 0) {
-                char *msg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                emit(ctx, "fprintf(stderr, \"%%s\\n\", %s); exit(1);\n", msg);
-                free(msg);
-            } else {
-                emit(ctx, "exit(1);\n");
-            }
-            free(method);
-            break;
-        }
-
-        /* Kernel#sleep */
-        if (!call->receiver && strcmp(method, "sleep") == 0) {
-            if (call->arguments && call->arguments->arguments.size > 0) {
-                char *secs = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                emit(ctx, "sleep((unsigned int)%s);\n", secs);
-                free(secs);
-            } else {
-                emit(ctx, "pause();\n"); /* sleep forever */
-            }
-            free(method);
-            break;
-        }
-
-        /* Kernel#warn → fprintf(stderr, ...) */
-        if (!call->receiver && strcmp(method, "warn") == 0) {
-            if (call->arguments && call->arguments->arguments.size > 0) {
-                char *msg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                emit(ctx, "fprintf(stderr, \"%%s\\n\", %s);\n", msg);
-                free(msg);
-            } else {
-                emit(ctx, "fputc('\\n', stderr);\n");
-            }
-            free(method);
-            break;
-        }
-
-        /* puts: output + newline */
-        if (!call->receiver && strcmp(method, "puts") == 0) {
-            /* In lambda mode: puts on a StrArray variable → iterate and print each */
-            if (ctx->lambda_mode && call->arguments && call->arguments->arguments.size > 0) {
-                pm_node_t *arg = call->arguments->arguments.nodes[0];
-                vtype_t at = infer_type(ctx, arg);
-                /* If the argument type is PROC or VALUE (could be StrArray from map), handle specially */
-                if (at.kind == SPINEL_TYPE_PROC || at.kind == SPINEL_TYPE_VALUE ||
-                    at.kind == SPINEL_TYPE_UNKNOWN) {
-                    char *ae = codegen_expr(ctx, arg);
-                    /* Emit: cast to sp_StrArray* and print each element */
-                    int tmp = ctx->temp_counter++;
-                    emit(ctx, "{ sp_StrArray *_pa_%d = (sp_StrArray *)%s;\n", tmp, ae);
-                    emit(ctx, "  for (int _pi_%d = 0; _pi_%d < _pa_%d->len; _pi_%d++) puts(_pa_%d->data[_pi_%d]); }\n",
-                         tmp, tmp, tmp, tmp, tmp, tmp);
-                    free(ae);
-                    free(method);
-                    break;
-                }
-            }
-            if (call->arguments && call->arguments->arguments.size > 0) {
-                pm_node_t *arg = call->arguments->arguments.nodes[0];
-                vtype_t at = infer_type(ctx, arg);
-                if (PM_NODE_TYPE(arg) == PM_INTERPOLATED_STRING_NODE) {
-                    /* Generate printf for interpolated string */
-                    pm_interpolated_string_node_t *is = (pm_interpolated_string_node_t *)arg;
-                    /* Build format string and args */
-                    char *fmt = xstrdup("");
-                    char *args = xstrdup("");
-                    for (size_t i = 0; i < is->parts.size; i++) {
-                        pm_node_t *part = is->parts.nodes[i];
-                        if (PM_NODE_TYPE(part) == PM_STRING_NODE) {
-                            pm_string_node_t *sn = (pm_string_node_t *)part;
-                            const uint8_t *src = pm_string_source(&sn->unescaped);
-                            size_t len = pm_string_length(&sn->unescaped);
-                            size_t bufsz = strlen(fmt) + len * 4 + 16;
-                            char *nf = malloc(bufsz);
-                            int pos = snprintf(nf, bufsz, "%s", fmt);
-                            for (size_t j = 0; j < len; j++) {
-                                uint8_t c = src[j];
-                                if (c == '\n') pos += snprintf(nf + pos, bufsz - pos, "\\n");
-                                else if (c == '\\') pos += snprintf(nf + pos, bufsz - pos, "\\\\");
-                                else if (c == '"') pos += snprintf(nf + pos, bufsz - pos, "\\\"");
-                                else if (c == '%') pos += snprintf(nf + pos, bufsz - pos, "%%%%");
-                                else pos += snprintf(nf + pos, bufsz - pos, "%c", c);
-                            }
-                            free(fmt); fmt = nf;
-                        } else if (PM_NODE_TYPE(part) == PM_EMBEDDED_STATEMENTS_NODE) {
-                            pm_embedded_statements_node_t *e = (pm_embedded_statements_node_t *)part;
-                            if (e->statements && e->statements->body.size > 0) {
-                                vtype_t et = infer_type(ctx, e->statements->body.nodes[0]);
-                                char *eexpr = codegen_expr(ctx, e->statements->body.nodes[0]);
-                                char *nf;
-                                if (et.kind == SPINEL_TYPE_INTEGER)
-                                    nf = sfmt("%s%%lld", fmt);
-                                else if (et.kind == SPINEL_TYPE_FLOAT)
-                                    nf = sfmt("%s%%g", fmt);
-                                else
-                                    nf = sfmt("%s%%s", fmt);
-                                free(fmt); fmt = nf;
-                                char *na = sfmt("%s, (long long)%s", args, eexpr);
-                                free(args); free(eexpr);
-                                args = na;
-                            }
-                        }
-                    }
-                    emit(ctx, "printf(\"%s\\n\"%s);\n", fmt, args);
-                    free(fmt); free(args);
-                } else if (at.kind == SPINEL_TYPE_STRING) {
-                    char *ae = codegen_expr(ctx, arg);
-                    emit(ctx, "{ const char *_ps = %s; fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '\\n') putchar('\\n'); }\n", ae);
-                    free(ae);
-                } else if (at.kind == SPINEL_TYPE_SP_STRING) {
-                    char *ae = codegen_expr(ctx, arg);
-                    emit(ctx, "{ const char *_ps = sp_String_cstr(%s); fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '\\n') putchar('\\n'); }\n", ae);
-                    free(ae);
-                } else if (at.kind == SPINEL_TYPE_BOOLEAN) {
-                    char *ae = codegen_expr(ctx, arg);
-                    emit(ctx, "puts(%s ? \"true\" : \"false\");\n", ae);
-                    free(ae);
-                } else if (at.kind == SPINEL_TYPE_FLOAT) {
-                    char *ae = codegen_expr(ctx, arg);
-                    emit(ctx, "{ const char *_fs = sp_float_to_s(%s); printf(\"%%s\\n\", _fs); }\n", ae);
-                    free(ae);
-                } else if (at.kind == SPINEL_TYPE_POLY) {
-                    char *ae = codegen_expr(ctx, arg);
-                    emit(ctx, "sp_poly_puts(%s);\n", ae);
-                    free(ae);
-                } else if (at.kind == SPINEL_TYPE_NIL) {
-                    emit(ctx, "putchar('\\n');\n");
-                } else {
-                    char *ae = codegen_expr(ctx, arg);
-                    emit(ctx, "printf(\"%%lld\\n\", (long long)%s);\n", ae);
-                    free(ae);
-                }
-            } else {
-                emit(ctx, "putchar('\\n');\n");
-            }
-            free(method);
-            break;
-        }
-
-        /* print */
-        if (!call->receiver && strcmp(method, "print") == 0) {
-            if (!try_print_chr(ctx, call)) {
-                if (call->arguments && call->arguments->arguments.size > 0) {
-                    char *ae = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                    emit(ctx, "printf(\"%%s\", %s);\n", ae);
-                    free(ae);
-                }
-            }
-            free(method);
-            break;
-        }
-
-        /* putc: output a single character (integer or string) */
-        if (!call->receiver && strcmp(method, "putc") == 0) {
-            if (call->arguments && call->arguments->arguments.size > 0) {
-                pm_node_t *arg = call->arguments->arguments.nodes[0];
-                vtype_t at = infer_type(ctx, arg);
-                char *ae = codegen_expr(ctx, arg);
-                if (at.kind == SPINEL_TYPE_INTEGER || at.kind == SPINEL_TYPE_FLOAT)
-                    emit(ctx, "putchar((int)%s);\n", ae);
-                else if (at.kind == SPINEL_TYPE_STRING)
-                    emit(ctx, "putchar(%s[0]);\n", ae);
-                else
-                    emit(ctx, "putchar((int)%s);\n", ae);
-                free(ae);
-            }
-            free(method);
-            break;
-        }
-
-        /* printf with format string */
-        if (!call->receiver && strcmp(method, "printf") == 0) {
-            if (call->arguments && call->arguments->arguments.size >= 1) {
-                char *fmt = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                if (call->arguments->arguments.size == 1) {
-                    emit(ctx, "printf(%s);\n", fmt);
-                } else {
-                    emit(ctx, "printf(%s", fmt);
-                    for (size_t i = 1; i < call->arguments->arguments.size; i++) {
-                        char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
-                        emit_raw(ctx, ", %s", a);
-                        free(a);
-                    }
-                    emit_raw(ctx, ");\n");
-                }
-                free(fmt);
-            }
-            free(method);
-            break;
-        }
-
-        /* p — debug print */
-        if (!call->receiver && strcmp(method, "p") == 0) {
-            if (call->arguments && call->arguments->arguments.size > 0) {
-                pm_node_t *arg = call->arguments->arguments.nodes[0];
-                vtype_t at = infer_type(ctx, arg);
-                char *ae = codegen_expr(ctx, arg);
-                if (at.kind == SPINEL_TYPE_STRING)
-                    emit(ctx, "{ const char *_ps = %s; fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '\\n') putchar('\\n'); }\n", ae);
-                else
-                    emit(ctx, "printf(\"%%lld\\n\", (long long)%s);\n", ae);
-                free(ae);
-            }
-            free(method);
-            break;
-        }
-
-        /* srand(n) → C srand */
-        if (!call->receiver && strcmp(method, "srand") == 0) {
-            if (call->arguments && call->arguments->arguments.size == 1) {
-                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                emit(ctx, "srand((unsigned int)%s);\n", arg);
-                free(arg);
-            } else {
-                emit(ctx, "srand(0);\n");
-            }
-            free(method);
-            break;
-        }
-
-        /* exit(n) → exit(n) */
-        if (!call->receiver && strcmp(method, "exit") == 0) {
-            if (call->arguments && call->arguments->arguments.size == 1) {
-                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                emit(ctx, "exit((int)%s);\n", arg);
-                free(arg);
-            } else {
-                emit(ctx, "exit(0);\n");
-            }
-            free(method);
-            break;
-        }
-
-        /* sleep(n) → sleep(n) (use unistd.h on POSIX) */
-        if (!call->receiver && strcmp(method, "sleep") == 0) {
-            if (call->arguments && call->arguments->arguments.size == 1) {
-                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                emit(ctx, "sleep((unsigned int)%s);\n", arg);
-                free(arg);
-            } else {
-                emit(ctx, "sleep(0);\n");
-            }
-            free(method);
-            break;
-        }
-
-        /* system("cmd") → system("cmd") as statement */
-        if (!call->receiver && strcmp(method, "system") == 0) {
-            if (call->arguments && call->arguments->arguments.size >= 1) {
-                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                emit(ctx, "fflush(stdout); sp_last_status = system(%s);\n", arg);
-                free(arg);
-            }
-            free(method);
-            break;
-        }
-
-        /* trap('SIGNAL') { block } → signal(SIGxxx, SIG_IGN) */
-        if (!call->receiver && strcmp(method, "trap") == 0) {
-            if (call->arguments && call->arguments->arguments.size >= 1) {
-                char *sig = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                /* Map Ruby signal names to C signal constants */
-                const char *csig = "SIGINT"; /* default */
-                /* Extract string content (remove quotes) for comparison */
-                if (strstr(sig, "INT")) csig = "SIGINT";
-                else if (strstr(sig, "WINCH")) csig = "SIGWINCH";
-                else if (strstr(sig, "TERM")) csig = "SIGTERM";
-                else if (strstr(sig, "HUP")) csig = "SIGHUP";
-                else if (strstr(sig, "PIPE")) csig = "SIGPIPE";
-                else if (strstr(sig, "USR1")) csig = "SIGUSR1";
-                else if (strstr(sig, "USR2")) csig = "SIGUSR2";
-                emit(ctx, "signal(%s, SIG_IGN);\n", csig);
-                free(sig);
-            }
-            free(method);
-            break;
-        }
-
-        /* loop do ... end → while (1) { body } */
-        if (!call->receiver && strcmp(method, "loop") == 0 &&
-            call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE) {
-            pm_block_node_t *blk = (pm_block_node_t *)call->block;
-            emit(ctx, "while (1) {\n");
-            ctx->indent++;
-            ctx->for_depth++;
-            if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
-            ctx->for_depth--;
-            ctx->indent--;
-            emit(ctx, "}\n");
-            free(method);
-            break;
-        }
-
-        /* report_duration(:label) { block } → just execute the block body */
-        if (!call->receiver && strcmp(method, "report_duration") == 0 &&
-            call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE) {
-            pm_block_node_t *blk = (pm_block_node_t *)call->block;
-            if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
-            free(method);
-            break;
-        }
-
-        /* raise "msg" or raise ClassName, "msg" */
-        if (!call->receiver && strcmp(method, "raise") == 0) {
-            int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
-            if (argc >= 2 && PM_NODE_TYPE(call->arguments->arguments.nodes[0]) == PM_CONSTANT_READ_NODE) {
-                /* raise ClassName, "message" */
-                pm_constant_read_node_t *cr = (pm_constant_read_node_t *)call->arguments->arguments.nodes[0];
-                char *cls = cstr(ctx, cr->name);
-                char *msg = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
-                emit(ctx, "sp_raise_cls(\"%s\", %s);\n", cls, msg);
-                free(cls); free(msg);
-            } else if (argc >= 1) {
-                char *msg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                emit(ctx, "sp_raise(%s);\n", msg);
-                free(msg);
-            } else {
-                emit(ctx, "sp_raise(\"RuntimeError\");\n");
-            }
-            free(method);
-            break;
-        }
-
-        /* throw :tag, value */
-        if (!call->receiver && strcmp(method, "throw") == 0 &&
-            call->arguments && call->arguments->arguments.size >= 1) {
-            pm_node_t *tag_node = call->arguments->arguments.nodes[0];
-            char *tag = codegen_expr(ctx, tag_node);
-            int argc = (int)call->arguments->arguments.size;
-            if (argc >= 2) {
-                pm_node_t *val_node = call->arguments->arguments.nodes[1];
-                vtype_t vt = infer_type(ctx, val_node);
-                char *val = codegen_expr(ctx, val_node);
-                if (vt.kind == SPINEL_TYPE_STRING)
-                    emit(ctx, "sp_throw_s(%s, %s);\n", tag, val);
-                else
-                    emit(ctx, "sp_throw_i(%s, %s);\n", tag, val);
-                free(val);
-            } else {
-                emit(ctx, "sp_throw_i(%s, 0);\n", tag);
-            }
-            free(tag); free(method);
-            break;
-        }
-
-        /* each_with_index on Array/StrArray → for loop with index (statement context) */
-        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
-            strcmp(method, "each_with_index") == 0 && call->receiver) {
-            vtype_t recv_t = infer_type(ctx, call->receiver);
-            if (recv_t.kind == SPINEL_TYPE_ARRAY || recv_t.kind == SPINEL_TYPE_STR_ARRAY) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = NULL, *bpidx = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                    if (bp->parameters && bp->parameters->requireds.size > 1) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[1];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            bpidx = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
-                int tmp = ctx->temp_counter++;
-                bool is_str = (recv_t.kind == SPINEL_TYPE_STR_ARRAY);
-                const char *len_fn = is_str ? "sp_StrArray_length" : "sp_IntArray_length";
-                emit(ctx, "for (mrb_int _ei_%d = 0; _ei_%d < %s(%s); _ei_%d++) {\n",
-                     tmp, tmp, len_fn, recv, tmp);
-                ctx->indent++;
-                if (bpname) {
-                    char *cn = make_cname(bpname, false);
-                    if (is_str)
-                        emit(ctx, "const char *%s = (%s)->data[_ei_%d];\n", cn, recv, tmp);
-                    else
-                        emit(ctx, "mrb_int %s = sp_IntArray_get(%s, _ei_%d);\n", cn, recv, tmp);
-                    free(cn);
-                }
-                if (bpidx) {
-                    char *cn = make_cname(bpidx, false);
-                    emit(ctx, "mrb_int %s = _ei_%d;\n", cn, tmp);
-                    free(cn);
-                }
-                if (blk->body) {
-                    bool saved_ir2 = ctx->implicit_return;
-                    ctx->implicit_return = false;
-                    codegen_stmts(ctx, (pm_node_t *)blk->body);
-                    ctx->implicit_return = saved_ir2;
-                }
-                ctx->indent--;
-                emit(ctx, "}\n");
-                free(recv); free(bpname); free(bpidx); free(method);
-                break;
-            }
-        }
-
-        /* File.open(path, mode) do |f| ... end → sp_File open/close block */
-        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
-            strcmp(method, "open") == 0 && call->receiver &&
-            PM_NODE_TYPE(call->receiver) == PM_CONSTANT_READ_NODE) {
-            pm_constant_read_node_t *cr = (pm_constant_read_node_t *)call->receiver;
-            if (ceq(ctx, cr->name, "File") && call->arguments &&
-                call->arguments->arguments.size >= 1) {
-                ctx->needs_file_io = true;
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *path_arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                char *mode_arg = NULL;
-                if (call->arguments->arguments.size >= 2)
-                    mode_arg = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
-                else
-                    mode_arg = xstrdup("\"r\"");
-                /* Get block parameter name */
-                char *bpname = extract_block_param(ctx, blk);
-                char *cn = bpname ? make_cname(bpname, false) : xstrdup("_fio");
-                emit(ctx, "{\n");
-                ctx->indent++;
-                emit(ctx, "sp_File *%s = sp_File_open(%s, %s);\n", cn, path_arg, mode_arg);
-                /* Register block param as FILE type */
-                if (bpname)
-                    var_declare(ctx, bpname, vt_prim(SPINEL_TYPE_FILE), false);
-                if (blk->body) {
-                    bool saved_ir = ctx->implicit_return;
-                    ctx->implicit_return = false;
-                    codegen_stmts(ctx, (pm_node_t *)blk->body);
-                    ctx->implicit_return = saved_ir;
-                }
-                emit(ctx, "sp_File_close(%s);\n", cn);
-                ctx->indent--;
-                emit(ctx, "}\n");
-                free(path_arg); free(mode_arg); free(bpname); free(cn); free(method);
-                break;
-            }
-        }
-
-        /* f.each_line do |line| ... end on FILE-typed receiver */
-        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
-            strcmp(method, "each_line") == 0 && call->receiver) {
-            vtype_t recv_t = infer_type(ctx, call->receiver);
-            if (recv_t.kind == SPINEL_TYPE_FILE) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = extract_block_param(ctx, blk);
-                int tmp = ctx->temp_counter++;
-                emit(ctx, "{ char _buf_%d[4096];\n", tmp);
-                emit(ctx, "while (fgets(_buf_%d, sizeof(_buf_%d), %s->fp)) {\n", tmp, tmp, recv);
-                ctx->indent++;
-                emit(ctx, "size_t _len_%d = strlen(_buf_%d);\n", tmp, tmp);
-                emit(ctx, "if (_len_%d > 0 && _buf_%d[_len_%d-1] == '\\n') _buf_%d[_len_%d-1] = '\\0';\n",
-                     tmp, tmp, tmp, tmp, tmp);
-                if (bpname) {
-                    char *cn = make_cname(bpname, false);
-                    emit(ctx, "const char *%s = _buf_%d;\n", cn, tmp);
-                    free(cn);
-                }
-                if (blk->body) {
-                    bool saved_ir = ctx->implicit_return;
-                    ctx->implicit_return = false;
-                    codegen_stmts(ctx, (pm_node_t *)blk->body);
-                    ctx->implicit_return = saved_ir;
-                }
-                ctx->indent--;
-                emit(ctx, "}\n");
-                emit(ctx, "}\n");
-                free(recv); free(bpname); free(method);
-                break;
-            }
-        }
-
-        /* f.puts / f.write / f.flock / f.seek / f.close on FILE-typed receiver (statement) */
-        if (call->receiver && (strcmp(method, "puts") == 0 || strcmp(method, "write") == 0 ||
-            strcmp(method, "flock") == 0 || strcmp(method, "seek") == 0 ||
-            strcmp(method, "close") == 0)) {
-            vtype_t recv_t = infer_type(ctx, call->receiver);
-            if (recv_t.kind == SPINEL_TYPE_FILE) {
-                char *recv = codegen_expr(ctx, call->receiver);
-                if (strcmp(method, "puts") == 0) {
-                    if (call->arguments && call->arguments->arguments.size > 0) {
-                        char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                        emit(ctx, "sp_File_puts(%s, %s);\n", recv, arg);
-                        free(arg);
-                    } else {
-                        emit(ctx, "fputc('\\n', %s->fp);\n", recv);
-                    }
-                } else if (strcmp(method, "write") == 0 && call->arguments &&
-                           call->arguments->arguments.size > 0) {
-                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                    emit(ctx, "sp_File_write_str(%s, %s);\n", recv, arg);
-                    free(arg);
-                } else if (strcmp(method, "flock") == 0 && call->arguments &&
-                           call->arguments->arguments.size > 0) {
-                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                    emit(ctx, "flock(fileno(%s->fp), %s);\n", recv, arg);
-                    free(arg);
-                } else if (strcmp(method, "seek") == 0 && call->arguments &&
-                           call->arguments->arguments.size > 0) {
-                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                    emit(ctx, "fseek(%s->fp, (long)%s, SEEK_SET);\n", recv, arg);
-                    free(arg);
-                } else if (strcmp(method, "close") == 0) {
-                    emit(ctx, "sp_File_close(%s);\n", recv);
-                }
-                free(recv); free(method);
-                break;
-            }
-        }
-
-        /* String#each_char with block → iterate over characters */
-        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
-            strcmp(method, "each_char") == 0 && call->receiver) {
-            vtype_t recv_t = infer_type(ctx, call->receiver);
-            if (recv_t.kind == SPINEL_TYPE_STRING || recv_t.kind == SPINEL_TYPE_SP_STRING) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = extract_block_param(ctx, blk);
-                const char *cstr_expr = (recv_t.kind == SPINEL_TYPE_SP_STRING)
-                    ? sfmt("sp_String_cstr(%s)", recv) : recv;
-                int tmp = ctx->temp_counter++;
-                emit(ctx, "{ const char *_cs_%d = %s; mrb_int _cl_%d = (mrb_int)strlen(_cs_%d);\n",
-                     tmp, cstr_expr, tmp, tmp);
-                emit(ctx, "for (mrb_int _ci_%d = 0; _ci_%d < _cl_%d; _ci_%d++) {\n",
-                     tmp, tmp, tmp, tmp);
-                ctx->indent++;
-                if (bpname) {
-                    char *cn = make_cname(bpname, false);
-                    emit(ctx, "char _cbuf_%d[2] = { _cs_%d[_ci_%d], 0 };\n", tmp, tmp, tmp);
-                    emit(ctx, "const char *%s = _cbuf_%d;\n", cn, tmp);
-                    free(cn);
-                }
-                if (blk->body) {
-                    bool saved_ir = ctx->implicit_return;
-                    ctx->implicit_return = false;
-                    codegen_stmts(ctx, (pm_node_t *)blk->body);
-                    ctx->implicit_return = saved_ir;
-                }
-                ctx->indent--;
-                emit(ctx, "} }\n");
-                if (recv_t.kind == SPINEL_TYPE_SP_STRING) free((char *)cstr_expr);
-                free(recv); free(bpname); free(method);
-                break;
-            }
-        }
-
-        /* String#each_line with block → split by newline and iterate */
-        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
-            strcmp(method, "each_line") == 0 && call->receiver) {
-            vtype_t recv_t = infer_type(ctx, call->receiver);
-            if (recv_t.kind == SPINEL_TYPE_STRING) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = extract_block_param(ctx, blk);
-                ctx->needs_str_split = true;
-                int tmp = ctx->temp_counter++;
-                emit(ctx, "{ sp_StrArray *_lines_%d = sp_str_split(%s, \"\\n\");\n", tmp, recv);
-                emit(ctx, "for (mrb_int _li_%d = 0; _li_%d < sp_StrArray_length(_lines_%d); _li_%d++) {\n",
-                     tmp, tmp, tmp, tmp);
-                ctx->indent++;
-                if (bpname) {
-                    char *cn = make_cname(bpname, false);
-                    emit(ctx, "const char *%s = _lines_%d->data[_li_%d];\n", cn, tmp, tmp);
-                    free(cn);
-                }
-                if (blk->body) {
-                    bool saved_ir2 = ctx->implicit_return;
-                    ctx->implicit_return = false;
-                    codegen_stmts(ctx, (pm_node_t *)blk->body);
-                    ctx->implicit_return = saved_ir2;
-                }
-                ctx->indent--;
-                emit(ctx, "}\n");
-                emit(ctx, "}\n");
-                free(recv); free(bpname); free(method);
-                break;
-            }
-        }
-
-        /* Array#each with block → inline for loop (statement context) */
-        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
-            strcmp(method, "each") == 0 && call->receiver) {
-            vtype_t recv_t = infer_type(ctx, call->receiver);
-            if (recv_t.kind == SPINEL_TYPE_ARRAY) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = extract_block_param(ctx, blk);
-                int tmp = ctx->temp_counter++;
-                emit(ctx, "for (mrb_int _ei_%d = 0; _ei_%d < sp_IntArray_length(%s); _ei_%d++) {\n",
-                     tmp, tmp, recv, tmp);
-                ctx->indent++;
-                if (bpname) {
-                    char *cn = make_cname(bpname, false);
-                    emit(ctx, "mrb_int %s = sp_IntArray_get(%s, _ei_%d);\n", cn, recv, tmp);
-                    free(cn);
-                }
-                if (blk->body) {
-                    bool saved_ir2 = ctx->implicit_return;
-                    ctx->implicit_return = false;
-                    codegen_stmts(ctx, (pm_node_t *)blk->body);
-                    ctx->implicit_return = saved_ir2;
-                }
-                ctx->indent--;
-                emit(ctx, "}\n");
-                free(recv); free(bpname); free(method);
-                break;
-            }
-
-            /* sp_RbArray#each with block → inline for loop with sp_RbValue elements */
-            if (recv_t.kind == SPINEL_TYPE_RB_ARRAY) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = extract_block_param(ctx, blk);
-                int tmp = ctx->temp_counter++;
-                emit(ctx, "for (mrb_int _ei_%d = 0; _ei_%d < sp_RbArray_length(%s); _ei_%d++) {\n",
-                     tmp, tmp, recv, tmp);
-                ctx->indent++;
-                /* Temporarily override the block param type to POLY */
-                int saved_vc = ctx->var_count;
-                vtype_t saved_type = {0};
-                var_entry_t *existing_v = bpname ? var_lookup(ctx, bpname) : NULL;
-                if (existing_v) {
-                    saved_type = existing_v->type;
-                    existing_v->type = vt_prim(SPINEL_TYPE_POLY);
-                } else if (bpname) {
-                    /* Force-add a new POLY entry at the end */
-                    assert(ctx->var_count < MAX_VARS);
-                    var_entry_t *nv = &ctx->vars[ctx->var_count++];
-                    snprintf(nv->name, sizeof(nv->name), "%s", bpname);
-                    nv->type = vt_prim(SPINEL_TYPE_POLY);
-                    nv->declared = false;
-                    nv->is_constant = false;
-                }
-                if (bpname) {
-                    char *cn = make_cname(bpname, false);
-                    emit(ctx, "sp_RbValue %s = sp_RbArray_get(%s, _ei_%d);\n", cn, recv, tmp);
-                    free(cn);
-                }
-                if (blk->body) {
-                    bool saved_ir2 = ctx->implicit_return;
-                    ctx->implicit_return = false;
-                    codegen_stmts(ctx, (pm_node_t *)blk->body);
-                    ctx->implicit_return = saved_ir2;
-                }
-                /* Restore var table */
-                if (existing_v) {
-                    existing_v->type = saved_type;
-                } else {
-                    ctx->var_count = saved_vc;
-                }
-                ctx->indent--;
-                emit(ctx, "}\n");
-                free(recv); free(bpname); free(method);
-                break;
-            }
-
-            /* Range#each with block |i| → inline for loop */
-            if (recv_t.kind == SPINEL_TYPE_RANGE) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = extract_block_param(ctx, blk);
-                int tmp = ctx->temp_counter++;
-                emit(ctx, "{ sp_Range _rng_%d = %s;\n", tmp, recv);
-                if (bpname) {
-                    char *cn = make_cname(bpname, false);
-                    emit(ctx, "for (mrb_int %s = _rng_%d.first; %s <= _rng_%d.last; %s++) {\n",
-                         cn, tmp, cn, tmp, cn);
-                    free(cn);
-                } else {
-                    emit(ctx, "for (mrb_int _ri_%d = _rng_%d.first; _ri_%d <= _rng_%d.last; _ri_%d++) {\n",
-                         tmp, tmp, tmp, tmp, tmp);
-                }
-                ctx->indent++;
-                if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
-                ctx->indent--;
-                emit(ctx, "}\n");
-                emit(ctx, "}\n");
-                free(recv); free(bpname); free(method);
-                break;
-            }
-
-            /* sp_StrArray#each with block → inline for loop with string elements */
-            if (recv_t.kind == SPINEL_TYPE_STR_ARRAY) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = extract_block_param(ctx, blk);
-                int tmp = ctx->temp_counter++;
-                emit(ctx, "for (mrb_int _ei_%d = 0; _ei_%d < sp_StrArray_length(%s); _ei_%d++) {\n",
-                     tmp, tmp, recv, tmp);
-                ctx->indent++;
-                if (bpname) {
-                    char *cn = make_cname(bpname, false);
-                    emit(ctx, "const char *%s = (%s)->data[_ei_%d];\n", cn, recv, tmp);
-                    free(cn);
-                }
-                if (blk->body) {
-                    bool saved_ir2 = ctx->implicit_return;
-                    ctx->implicit_return = false;
-                    codegen_stmts(ctx, (pm_node_t *)blk->body);
-                    ctx->implicit_return = saved_ir2;
-                }
-                ctx->indent--;
-                emit(ctx, "}\n");
-                free(recv); free(bpname); free(method);
-                break;
-            }
-
-            /* Object method with block → generate block callback and pass to method */
-            if (recv_t.kind == SPINEL_TYPE_OBJECT) {
-                class_info_t *rcls = find_class(ctx, recv_t.klass);
-                if (rcls) {
-                    class_info_t *owner = NULL;
-                    method_info_t *target = find_method_inherited(ctx, rcls, method, &owner);
-                    if (target && target->body_node && has_yield_nodes(target->body_node)) {
-                        pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                        char *recv = codegen_expr(ctx, call->receiver);
-
-                        /* Detect non-local return in block body */
-                        bool has_nonlocal_return = blk->body && block_has_return((pm_node_t *)blk->body);
-
-                        /* Extract block parameter name */
-                        char *bpname = NULL;
-                        if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                            pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                            if (bp->parameters && bp->parameters->requireds.size > 0) {
-                                pm_node_t *p = bp->parameters->requireds.nodes[0];
-                                if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                                    bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                            }
-                        }
-
-                        /* Scan captures: variables used in block body (excluding block param) */
-                        capture_list_t local_defs = {.count = 0};
-                        capture_list_t captures = {.count = 0};
-                        scan_captures(ctx, (pm_node_t *)blk->body,
-                                      bpname ? bpname : "", &local_defs, &captures);
-
-                        /* Generate block callback (written to block_out) */
-                        int blk_id = ctx->block_counter++;
-                        FILE *saved_out = ctx->out;
-                        if (ctx->block_out) ctx->out = ctx->block_out;
-
-                        /* Env struct: captured scalars by pointer */
-                        emit_raw(ctx, "typedef struct { ");
-                        for (int ci = 0; ci < captures.count; ci++) {
-                            var_entry_t *v = var_lookup(ctx, captures.names[ci]);
-                            if (!v) continue;
-                            char *cn = make_cname(v->name, false);
-                            emit_raw(ctx, "mrb_int *%s; ", cn);
-                            free(cn);
-                        }
-                        if (has_nonlocal_return) {
-                            emit_raw(ctx, "volatile mrb_int *_blk_ret_val; int _blk_ret_depth; ");
-                        }
-                        if (captures.count == 0 && !has_nonlocal_return) emit_raw(ctx, "int _dummy; ");
-                        emit_raw(ctx, "} _blk_env_%d_t;\n", blk_id);
-
-                        emit_raw(ctx, "static mrb_int _blk_%d(void *_e, mrb_int _arg) {\n", blk_id);
-                        emit_raw(ctx, "    _blk_env_%d_t *_env = (_blk_env_%d_t *)_e;\n", blk_id, blk_id);
-
-                        /* Block parameter from _arg */
-                        if (bpname) {
-                            char *cn = make_cname(bpname, false);
-                            emit_raw(ctx, "    mrb_int %s = _arg;\n", cn);
-                            free(cn);
-                        }
-
-                        /* Alias captured variables: #define lv_total (*_env->lv_total) */
-                        for (int ci = 0; ci < captures.count; ci++) {
-                            var_entry_t *v = var_lookup(ctx, captures.names[ci]);
-                            if (!v) continue;
-                            char *cn = make_cname(v->name, false);
-                            emit_raw(ctx, "    #define %s (*_env->%s)\n", cn, cn);
-                            free(cn);
-                        }
-
-                        /* For non-local return, alias _e for the return macros */
-                        if (has_nonlocal_return) {
-                            emit_raw(ctx, "    #define _e _env\n");
-                        }
-
-                        /* Generate block body */
-                        int saved_indent = ctx->indent;
-                        ctx->indent = 1;
-                        bool saved_in_block_nonlocal = ctx->in_block_nonlocal;
-                        int saved_block_return_id = ctx->block_return_id;
-                        if (has_nonlocal_return) {
-                            ctx->in_block_nonlocal = true;
-                            ctx->block_return_id = blk_id;
-                        }
-                        if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
-                        ctx->in_block_nonlocal = saved_in_block_nonlocal;
-                        ctx->block_return_id = saved_block_return_id;
-                        ctx->indent = saved_indent;
-
-                        if (has_nonlocal_return) {
-                            emit_raw(ctx, "    #undef _e\n");
-                        }
-
-                        /* Undefine aliases */
-                        for (int ci = 0; ci < captures.count; ci++) {
-                            var_entry_t *v = var_lookup(ctx, captures.names[ci]);
-                            if (!v) continue;
-                            char *cn = make_cname(v->name, false);
-                            emit_raw(ctx, "    #undef %s\n", cn);
-                            free(cn);
-                        }
-
-                        emit_raw(ctx, "    return 0;\n");
-                        emit_raw(ctx, "}\n");
-
-                        ctx->out = saved_out;
-
-                        if (has_nonlocal_return) {
-                            /* Non-local return: wrap call with setjmp/longjmp */
-                            emit(ctx, "{ volatile mrb_int _blk_ret_val_%d = 0;\n", blk_id);
-                            emit(ctx, "sp_exc_depth++;\n");
-                            emit(ctx, "_blk_env_%d_t _env_%d;\n", blk_id, blk_id);
-                            for (int ci = 0; ci < captures.count; ci++) {
-                                var_entry_t *v = var_lookup(ctx, captures.names[ci]);
-                                if (!v) continue;
-                                char *cn = make_cname(v->name, false);
-                                emit(ctx, "_env_%d.%s = &%s;\n", blk_id, cn, cn);
-                                free(cn);
-                            }
-                            emit(ctx, "_env_%d._blk_ret_val = &_blk_ret_val_%d;\n", blk_id, blk_id);
-                            emit(ctx, "_env_%d._blk_ret_depth = sp_exc_depth - 1;\n", blk_id);
-
-                            const char *c_mname = sanitize_method(method);
-                            class_info_t *def_cls = owner ? owner : rcls;
-
-                            emit(ctx, "if (setjmp(sp_exc_stack[sp_exc_depth - 1]) == 0) {\n");
-                            ctx->indent++;
-                            emit(ctx, "sp_%s_%s(%s, (sp_block_fn)_blk_%d, &_env_%d);\n",
-                                 def_cls->name, c_mname, recv, blk_id, blk_id);
-                            emit(ctx, "sp_exc_depth--;\n");
-                            ctx->indent--;
-                            emit(ctx, "} else {\n");
-                            ctx->indent++;
-                            emit(ctx, "sp_exc_depth--;\n");
-                            emit(ctx, "return _blk_ret_val_%d;\n", blk_id);
-                            ctx->indent--;
-                            emit(ctx, "}\n");
-                            emit(ctx, "}\n");
-                        } else {
-                            /* Set up the environment struct */
-                            emit(ctx, "{ _blk_env_%d_t _env_%d;\n", blk_id, blk_id);
-                            for (int ci = 0; ci < captures.count; ci++) {
-                                var_entry_t *v = var_lookup(ctx, captures.names[ci]);
-                                if (!v) continue;
-                                char *cn = make_cname(v->name, false);
-                                emit(ctx, "_env_%d.%s = &%s;\n", blk_id, cn, cn);
-                                free(cn);
-                            }
-
-                            /* Call the method with block */
-                            const char *c_mname = sanitize_method(method);
-                            class_info_t *def_cls = owner ? owner : rcls;
-                            emit(ctx, "sp_%s_%s(%s, (sp_block_fn)_blk_%d, &_env_%d);\n",
-                                 def_cls->name, c_mname, recv, blk_id, blk_id);
-                            emit(ctx, "}\n");
-                        }
-
-                        free(recv); free(bpname); free(method);
-                        break;
-                    }
-                }
-            }
-
-            /* sp_RbHash#each with block |k, v| → inline loop (k=string, v=sp_RbValue) */
-            if (recv_t.kind == SPINEL_TYPE_RB_HASH) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *kname = NULL, *vname = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            kname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                    if (bp->parameters && bp->parameters->requireds.size > 1) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[1];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            vname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
-                int tmp = ctx->temp_counter++;
-                emit(ctx, "for (sp_RbHashEntry *_rhe_%d = %s->first; _rhe_%d; _rhe_%d = _rhe_%d->order_next) {\n",
-                     tmp, recv, tmp, tmp, tmp);
-                ctx->indent++;
-                if (kname) {
-                    char *cn = make_cname(kname, false);
-                    emit(ctx, "%s = _rhe_%d->key;\n", cn, tmp);
-                    free(cn);
-                }
-                if (vname) {
-                    char *cn = make_cname(vname, false);
-                    emit(ctx, "%s = _rhe_%d->value;\n", cn, tmp);
-                    free(cn);
-                }
-                if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
-                ctx->indent--;
-                emit(ctx, "}\n");
-                free(recv); free(kname); free(vname); free(method);
-                break;
-            }
-
-            /* Hash#each with block |k, v| → inline loop over insertion-order list */
-            if (recv_t.kind == SPINEL_TYPE_HASH) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *kname = NULL, *vname = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            kname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                    if (bp->parameters && bp->parameters->requireds.size > 1) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[1];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            vname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
-                int tmp = ctx->temp_counter++;
-                emit(ctx, "for (sp_HashEntry *_he_%d = %s->first; _he_%d; _he_%d = _he_%d->order_next) {\n",
-                     tmp, recv, tmp, tmp, tmp);
-                ctx->indent++;
-                if (kname) {
-                    char *cn = make_cname(kname, false);
-                    emit(ctx, "%s = _he_%d->key;\n", cn, tmp);
-                    free(cn);
-                }
-                if (vname) {
-                    char *cn = make_cname(vname, false);
-                    emit(ctx, "%s = _he_%d->value;\n", cn, tmp);
-                    free(cn);
-                }
-                if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
-                ctx->indent--;
-                emit(ctx, "}\n");
-                free(recv); free(kname); free(vname); free(method);
-                break;
-            }
-        }
-
-        /* String#scan(regexp) { |m| ... } → inline loop with onig_search */
-        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
-            strcmp(method, "scan") == 0 && call->receiver &&
-            call->arguments && call->arguments->arguments.size == 1) {
-            vtype_t recv_t = infer_type(ctx, call->receiver);
-            vtype_t arg_t = infer_type(ctx, call->arguments->arguments.nodes[0]);
-            if (recv_t.kind == SPINEL_TYPE_STRING && arg_t.kind == SPINEL_TYPE_REGEXP) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *pat = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                char *bpname = extract_block_param(ctx, blk);
-                int tmp = ctx->temp_counter++;
-                emit(ctx, "{ /* scan */\n");
-                ctx->indent++;
-                emit(ctx, "const char *_ss_%d = %s;\n", tmp, recv);
-                emit(ctx, "OnigRegion *_sr_%d = onig_region_new();\n", tmp);
-                emit(ctx, "const OnigUChar *_se_%d = (const OnigUChar *)_ss_%d + strlen(_ss_%d);\n", tmp, tmp, tmp);
-                emit(ctx, "int _sp_%d = 0;\n", tmp);
-                emit(ctx, "while (_sp_%d >= 0) {\n", tmp);
-                ctx->indent++;
-                emit(ctx, "_sp_%d = onig_search(%s, (const OnigUChar *)_ss_%d, _se_%d,\n", tmp, pat, tmp, tmp);
-                emit(ctx, "    (const OnigUChar *)_ss_%d + _sp_%d, _se_%d, _sr_%d, ONIG_OPTION_NONE);\n", tmp, tmp, tmp, tmp);
-                emit(ctx, "if (_sp_%d >= 0) {\n", tmp);
-                ctx->indent++;
-                if (bpname) {
-                    char *cn = make_cname(bpname, false);
-                    emit(ctx, "int _ml_%d = _sr_%d->end[0] - _sr_%d->beg[0];\n", tmp, tmp, tmp);
-                    emit(ctx, "char *%s = (char *)malloc(_ml_%d + 1);\n", cn, tmp);
-                    emit(ctx, "memcpy(%s, _ss_%d + _sr_%d->beg[0], _ml_%d);\n", cn, tmp, tmp, tmp);
-                    emit(ctx, "%s[_ml_%d] = '\\0';\n", cn, tmp);
-                    free(cn);
-                }
-                if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
-                emit(ctx, "_sp_%d = _sr_%d->end[0];\n", tmp, tmp);
-                ctx->indent--;
-                emit(ctx, "}\n");
-                ctx->indent--;
-                emit(ctx, "}\n");
-                emit(ctx, "onig_region_free(_sr_%d, 1);\n", tmp);
-                ctx->indent--;
-                emit(ctx, "}\n");
-                free(recv); free(pat); free(bpname); free(method);
-                break;
-            }
-        }
-
-        /* Receiver-less call with block to yield function → generate callback */
-        if (!call->receiver && call->block &&
-            PM_NODE_TYPE(call->block) == PM_BLOCK_NODE) {
-            func_info_t *fn = find_func(ctx, method);
-            if (fn && fn->has_yield) {
-                pm_block_node_t *blk = (pm_block_node_t *)call->block;
-                int blk_id = ctx->block_counter++;
-
-                /* Detect non-local return in block body */
-                bool has_nonlocal_return = blk->body && block_has_return((pm_node_t *)blk->body);
-
-                /* Get block parameter name */
-                char *bpname = extract_block_param(ctx, blk);
-
-                /* Scan block body for captured variables (variables from the caller's scope) */
-                capture_list_t local_defs = {.count = 0};
-                capture_list_t captures = {.count = 0};
-                scan_captures(ctx, (pm_node_t *)blk->body,
-                              bpname ? bpname : "", &local_defs, &captures);
-
-                /* Generate the block body first (to a temp buffer). Any nested blocks
-                 * will be written to ctx->block_out during body generation, so they
-                 * appear BEFORE this block in the output (correct C ordering). */
-                int saved_indent = ctx->indent;
-                int saved_var_count = ctx->var_count;
-                ctx->indent = 1;
-
-                /* Register block param in var table */
-                if (bpname)
-                    var_declare(ctx, bpname, vt_prim(SPINEL_TYPE_INTEGER), false);
-
-                char *body_processed = NULL;
-                {
-                    char *body_buf_data = NULL;
-                    size_t body_buf_size = 0;
-                    FILE *body_buf = open_memstream(&body_buf_data, &body_buf_size);
-                    FILE *saved_out = ctx->out;
-                    ctx->out = body_buf;
-
-                    /* Set non-local return context if block has return */
-                    bool saved_in_block_nonlocal = ctx->in_block_nonlocal;
-                    int saved_block_return_id = ctx->block_return_id;
-                    if (has_nonlocal_return) {
-                        ctx->in_block_nonlocal = true;
-                        ctx->block_return_id = blk_id;
-                    }
-
-                    if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
-
-                    ctx->in_block_nonlocal = saved_in_block_nonlocal;
-                    ctx->block_return_id = saved_block_return_id;
-
-                    fclose(body_buf);
-                    ctx->out = saved_out;
-
-                    /* Replace lv_CAPNAME with (*_e->CAPNAME) for captured vars */
-                    if (body_buf_data) {
-                        body_processed = xstrdup(body_buf_data);
-                        for (int i = 0; i < captures.count; i++) {
-                            char *old_ref = sfmt("lv_%s", captures.names[i]);
-                            char *new_ref = sfmt("(*_e->%s)", captures.names[i]);
-                            while (1) {
-                                char *pos = strstr(body_processed, old_ref);
-                                if (!pos) break;
-                                size_t prefix_len = pos - body_processed;
-                                size_t old_len = strlen(old_ref);
-                                size_t new_len = strlen(new_ref);
-                                size_t rest_len = strlen(pos + old_len);
-                                char *nr = malloc(prefix_len + new_len + rest_len + 1);
-                                memcpy(nr, body_processed, prefix_len);
-                                memcpy(nr + prefix_len, new_ref, new_len);
-                                memcpy(nr + prefix_len + new_len, pos + old_len, rest_len + 1);
-                                free(body_processed);
-                                body_processed = nr;
-                            }
-                            free(old_ref); free(new_ref);
-                        }
-                        free(body_buf_data);
-                    }
-                }
-
-                ctx->indent = saved_indent;
-                ctx->var_count = saved_var_count;
-
-                /* Now write the complete block function to block_out.
-                 * At this point, any nested blocks have already been written to
-                 * block_out, so they appear before this block (correct for C). */
-                if (ctx->block_out) {
-                    /* Env struct */
-                    fprintf(ctx->block_out, "typedef struct { ");
-                    for (int i = 0; i < captures.count; i++)
-                        fprintf(ctx->block_out, "mrb_int *%s; ", captures.names[i]);
-                    if (has_nonlocal_return) {
-                        fprintf(ctx->block_out, "volatile mrb_int *_blk_ret_val; int _blk_ret_depth; ");
-                    }
-                    if (captures.count == 0 && !has_nonlocal_return) fprintf(ctx->block_out, "int _dummy; ");
-                    fprintf(ctx->block_out, "} _blk_%d_env;\n", blk_id);
-
-                    /* Callback function */
-                    fprintf(ctx->block_out, "static mrb_int _blk_%d(void *_env, mrb_int _arg) {\n", blk_id);
-                    fprintf(ctx->block_out, "    _blk_%d_env *_e = (_blk_%d_env *)_env;\n", blk_id, blk_id);
-                    if (bpname) {
-                        char *cn = make_cname(bpname, false);
-                        fprintf(ctx->block_out, "    mrb_int %s = _arg;\n", cn);
-                        free(cn);
-                    }
-                    if (body_processed) {
-                        fprintf(ctx->block_out, "%s", body_processed);
-                    }
-                    fprintf(ctx->block_out, "    return 0;\n");
-                    fprintf(ctx->block_out, "}\n\n");
-                }
-                free(body_processed);
-
-                /* Generate the call site: env init + function call */
-                if (has_nonlocal_return) {
-                    /* Non-local return: wrap call with setjmp/longjmp */
-                    emit(ctx, "{ volatile mrb_int _blk_ret_val_%d = 0;\n", blk_id);
-                    emit(ctx, "sp_exc_depth++;\n");
-                    emit(ctx, "_blk_%d_env _env_%d = { ", blk_id, blk_id);
-                    for (int i = 0; i < captures.count; i++) {
-                        char *cn = make_cname(captures.names[i], false);
-                        emit_raw(ctx, "&%s, ", cn);
-                        free(cn);
-                    }
-                    emit_raw(ctx, "&_blk_ret_val_%d, sp_exc_depth - 1 };\n", blk_id);
-
-                    emit(ctx, "if (setjmp(sp_exc_stack[sp_exc_depth - 1]) == 0) {\n");
-                    ctx->indent++;
-
-                    /* Build arguments */
-                    int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
-                    char *args = xstrdup("");
-                    for (int i = 0; i < argc; i++) {
-                        char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
-                        char *na = sfmt("%s%s%s", args, i > 0 ? ", " : "", a);
-                        free(args); free(a);
-                        args = na;
-                    }
-                    emit(ctx, "sp_%s(%s%s(sp_block_fn)_blk_%d, &_env_%d);\n",
-                         fn->name, args, argc > 0 ? ", " : "", blk_id, blk_id);
-                    emit(ctx, "sp_exc_depth--;\n");
-                    free(args);
-
-                    ctx->indent--;
-                    emit(ctx, "} else {\n");
-                    ctx->indent++;
-                    emit(ctx, "sp_exc_depth--;\n");
-                    emit(ctx, "return _blk_ret_val_%d;\n", blk_id);
-                    ctx->indent--;
-                    emit(ctx, "}\n");
-                    emit(ctx, "}\n");
-                } else {
-                    emit(ctx, "_blk_%d_env _env_%d = { ", blk_id, blk_id);
-                    for (int i = 0; i < captures.count; i++) {
-                        char *cn = make_cname(captures.names[i], false);
-                        emit_raw(ctx, "%s&%s", i > 0 ? ", " : "", cn);
-                        free(cn);
-                    }
-                    if (captures.count == 0) emit_raw(ctx, "0");
-                    emit_raw(ctx, " };\n");
-
-                    /* Build arguments */
-                    int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
-                    char *args = xstrdup("");
-                    for (int i = 0; i < argc; i++) {
-                        char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
-                        char *na = sfmt("%s%s%s", args, i > 0 ? ", " : "", a);
-                        free(args); free(a);
-                        args = na;
-                    }
-                    emit(ctx, "sp_%s(%s%s(sp_block_fn)_blk_%d, &_env_%d);\n",
-                         fn->name, args, argc > 0 ? ", " : "", blk_id, blk_id);
-                    free(args);
-                }
-                free(bpname); free(method);
-                break;
-            }
-        }
-
-        /* Integer#times with block → for loop */
-        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
-            strcmp(method, "times") == 0) {
-            pm_block_node_t *blk = (pm_block_node_t *)call->block;
-            char *count = codegen_expr(ctx, call->receiver);
-
-            /* Get block parameter name */
-            char *bpname = NULL;
-            if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                if (bp->parameters && bp->parameters->requireds.size > 0) {
-                    pm_node_t *p = bp->parameters->requireds.nodes[0];
-                    if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                        bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                }
-            }
-
-            if (bpname) {
-                char *cn = make_cname(bpname, false);
-                emit(ctx, "for (%s = 0; %s < %s; %s++) {\n", cn, cn, count, cn);
-                free(cn); free(bpname);
-            } else {
-                int tmp = ctx->temp_counter++;
-                emit(ctx, "for (mrb_int _it%d = 0; _it%d < %s; _it%d++) {\n",
-                     tmp, tmp, count, tmp);
-            }
-            free(count);
-
-            ctx->indent++;
-            ctx->for_depth++;
-            if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
-            ctx->for_depth--;
-            ctx->indent--;
-            emit(ctx, "}\n");
-            free(method);
-            break;
-        }
-
-        /* Integer#upto/downto with block → for loop */
-        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
-            (strcmp(method, "upto") == 0 || strcmp(method, "downto") == 0) &&
-            call->arguments && call->arguments->arguments.size == 1) {
-            pm_block_node_t *blk = (pm_block_node_t *)call->block;
-            char *start = codegen_expr(ctx, call->receiver);
-            char *end = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-            bool is_upto = strcmp(method, "upto") == 0;
-
-            char *bpname = NULL;
-            if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                if (bp->parameters && bp->parameters->requireds.size > 0) {
-                    pm_node_t *p = bp->parameters->requireds.nodes[0];
-                    if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                        bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                }
-            }
-            if (bpname) {
-                char *cn = make_cname(bpname, false);
-                if (is_upto)
-                    emit(ctx, "for (%s = %s; %s <= %s; %s++) {\n", cn, start, cn, end, cn);
-                else
-                    emit(ctx, "for (%s = %s; %s >= %s; %s--) {\n", cn, start, cn, end, cn);
-                free(cn); free(bpname);
-            } else {
-                int tmp = ctx->temp_counter++;
-                if (is_upto)
-                    emit(ctx, "for (mrb_int _it%d = %s; _it%d <= %s; _it%d++) {\n", tmp, start, tmp, end, tmp);
-                else
-                    emit(ctx, "for (mrb_int _it%d = %s; _it%d >= %s; _it%d--) {\n", tmp, start, tmp, end, tmp);
-            }
-            free(start); free(end);
-            ctx->indent++;
-            ctx->for_depth++;
-            if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
-            ctx->for_depth--;
-            ctx->indent--;
-            emit(ctx, "}\n");
-            free(method);
-            break;
-        }
-
-        /* sp_String replace/clear as statement */
-        if (call->receiver && PM_NODE_TYPE(call->receiver) == PM_LOCAL_VARIABLE_READ_NODE) {
-            vtype_t recv_t = infer_type(ctx, call->receiver);
-            if (recv_t.kind == SPINEL_TYPE_SP_STRING) {
-                if (strcmp(method, "replace") == 0 && call->arguments &&
-                    call->arguments->arguments.size == 1) {
-                    pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
-                    char *vn = cstr(ctx, lv->name);
-                    char *cn = make_cname(vn, false);
-                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                    emit(ctx, "sp_String_replace(%s, %s);\n", cn, arg);
-                    free(vn); free(cn); free(arg); free(method);
-                    break;
-                }
-                if (strcmp(method, "clear") == 0) {
-                    pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
-                    char *vn = cstr(ctx, lv->name);
-                    char *cn = make_cname(vn, false);
-                    emit(ctx, "sp_String_clear(%s);\n", cn);
-                    free(vn); free(cn); free(method);
-                    break;
-                }
-            }
-        }
-
-        /* String << (append) as statement */
-        if (call->receiver && strcmp(method, "<<") == 0 &&
-            call->arguments && call->arguments->arguments.size == 1) {
-            vtype_t recv_t = infer_type(ctx, call->receiver);
-            if (PM_NODE_TYPE(call->receiver) == PM_LOCAL_VARIABLE_READ_NODE) {
-                if (recv_t.kind == SPINEL_TYPE_SP_STRING) {
-                    /* Mutable string: sp_String_append(s, arg) */
-                    pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
-                    char *vn = cstr(ctx, lv->name);
-                    char *cn = make_cname(vn, false);
-                    pm_node_t *arg_node = call->arguments->arguments.nodes[0];
-                    vtype_t arg_t = infer_type(ctx, arg_node);
-                    char *arg = codegen_expr(ctx, arg_node);
-                    if (arg_t.kind == SPINEL_TYPE_SP_STRING)
-                        emit(ctx, "sp_String_append_str(%s, %s);\n", cn, arg);
-                    else if (arg_t.kind == SPINEL_TYPE_INTEGER)
-                        emit(ctx, "sp_String_append(%s, sp_int_to_s(%s));\n", cn, arg);
-                    else
-                        emit(ctx, "sp_String_append(%s, %s);\n", cn, arg);
-                    free(vn); free(cn); free(arg); free(method);
-                    break;
-                }
-                if (recv_t.kind == SPINEL_TYPE_STRING) {
-                    /* Immutable string: reassign with concat */
-                    pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
-                    char *vn = cstr(ctx, lv->name);
-                    char *cn = make_cname(vn, false);
-                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                    emit(ctx, "%s = sp_str_concat(%s, %s);\n", cn, cn, arg);
-                    free(vn); free(cn); free(arg); free(method);
-                    break;
-                }
-            }
-            if (recv_t.kind == SPINEL_TYPE_ARRAY) {
-                /* IntArray << val → sp_IntArray_push(arr, val) */
-                char *recv = codegen_expr(ctx, call->receiver);
-                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                emit(ctx, "sp_IntArray_push(%s, %s);\n", recv, arg);
-                free(recv); free(arg); free(method);
-                break;
-            }
-        }
-
-        /* receiver.puts / receiver.print on non-FILE (unknown/VALUE) → fallback to stdout */
-        if (call->receiver && (strcmp(method, "puts") == 0 || strcmp(method, "print") == 0)) {
-            vtype_t recv_t = infer_type(ctx, call->receiver);
-            if (recv_t.kind == SPINEL_TYPE_VALUE || recv_t.kind == SPINEL_TYPE_UNKNOWN) {
-                bool is_puts = strcmp(method, "puts") == 0;
-                if (call->arguments && call->arguments->arguments.size > 0) {
-                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                    if (is_puts)
-                        emit(ctx, "fprintf(stdout, \"%%s\\n\", %s);\n", arg);
-                    else
-                        emit(ctx, "fprintf(stdout, \"%%s\", %s);\n", arg);
-                    free(arg);
-                } else {
-                    if (is_puts)
-                        emit(ctx, "fputc('\\n', stdout);\n");
-                    /* print with no args is a no-op */
-                }
-                free(method);
-                break;
-            }
-        }
-
-        /* General call as statement */
-        {
-            char *expr = codegen_expr(ctx, node);
-            emit(ctx, "%s;\n", expr);
-            free(expr); free(method);
-        }
+    case PM_CALL_NODE:
+        codegen_stmt_call(ctx, (pm_call_node_t *)node, node);
         break;
-    }
+
 
     case PM_ELSE_NODE: {
         pm_else_node_t *n = (pm_else_node_t *)node;
