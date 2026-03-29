@@ -772,6 +772,23 @@ class Compiler
       end
       return "void"
     end
+    if t == "CaseNode"
+      # Infer from first when branch
+      conds = parse_id_list(@nd_conditions[nid])
+      if conds.length > 0
+        wid = conds[0]
+        if @nd_type[wid] == "WhenNode"
+          wbody = @nd_body[wid]
+          if wbody >= 0
+            ws = get_stmts(wbody)
+            if ws.length > 0
+              return infer_type(ws[ws.length - 1])
+            end
+          end
+        end
+      end
+      return "int"
+    end
     if t == "AndNode"
       return "bool"
     end
@@ -997,6 +1014,12 @@ class Compiler
       end
       return "int_array"
     end
+    if mname == "reject"
+      if recv >= 0
+        return infer_type(recv)
+      end
+      return "int_array"
+    end
     if mname == "[]"
       if recv >= 0
         rt = infer_type(recv)
@@ -1039,6 +1062,18 @@ class Compiler
         return infer_type(recv)
       end
       return "string"
+    end
+    if mname == "to_a"
+      if recv >= 0
+        rt = infer_type(recv)
+        if rt == "range"
+          return "int_array"
+        end
+        if rt == "int_array"
+          return "int_array"
+        end
+      end
+      return "int_array"
     end
 
     # Method call on object
@@ -1738,7 +1773,209 @@ class Compiler
   end
 
   # ---- Return type inference ----
+  def infer_constructor_types
+    # Scan AST for ClassName.new(args) calls and infer param types
+    scan_new_calls(@root_id)
+  end
+
+  def scan_new_calls(nid)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "CallNode"
+      # Also infer top-level method param types from call sites
+      mname = @nd_name[nid]
+      if @nd_receiver[nid] < 0
+        mi = find_method_idx(mname)
+        if mi >= 0
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            arg_ids = get_args(args_id)
+            ptypes = @meth_param_types[mi].split(",")
+            k = 0
+            while k < arg_ids.length
+              at = infer_type(arg_ids[k])
+              if k < ptypes.length
+                if ptypes[k] == "int"
+                  if at != "int"
+                    ptypes[k] = at
+                  end
+                end
+              end
+              k = k + 1
+            end
+            @meth_param_types[mi] = join_sep(ptypes, ",")
+          end
+        end
+      end
+      if @nd_name[nid] == "new"
+        recv = @nd_receiver[nid]
+        if recv >= 0
+          if @nd_type[recv] == "ConstantReadNode"
+            cname = @nd_name[recv]
+            ci = find_class_idx(cname)
+            if ci >= 0
+              init_ci = find_init_class(ci)
+              if init_ci >= 0
+                init_idx = cls_find_method_direct(init_ci, "initialize")
+                if init_idx >= 0
+                  args_id = @nd_arguments[nid]
+                  if args_id >= 0
+                    arg_ids = get_args(args_id)
+                    all_ptypes = @cls_meth_ptypes[init_ci].split("|")
+                    if init_idx < all_ptypes.length
+                      ptypes = all_ptypes[init_idx].split(",")
+                      k = 0
+                      while k < arg_ids.length
+                        at = infer_type(arg_ids[k])
+                        if k < ptypes.length
+                          if ptypes[k] == "int"
+                            if at != "int"
+                              ptypes[k] = at
+                            end
+                          end
+                        end
+                        k = k + 1
+                      end
+                      all_ptypes[init_idx] = join_sep(ptypes, ",")
+                      @cls_meth_ptypes[init_ci] = join_sep(all_ptypes, "|")
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    # Recurse into children
+    if @nd_body[nid] >= 0
+      scan_new_calls(@nd_body[nid])
+    end
+    stmts = parse_id_list(@nd_stmts[nid])
+    k = 0
+    while k < stmts.length
+      scan_new_calls(stmts[k])
+      k = k + 1
+    end
+    if @nd_receiver[nid] >= 0
+      scan_new_calls(@nd_receiver[nid])
+    end
+    if @nd_arguments[nid] >= 0
+      scan_new_calls(@nd_arguments[nid])
+    end
+    args = parse_id_list(@nd_args[nid])
+    k = 0
+    while k < args.length
+      scan_new_calls(args[k])
+      k = k + 1
+    end
+    if @nd_expression[nid] >= 0
+      scan_new_calls(@nd_expression[nid])
+    end
+    if @nd_predicate[nid] >= 0
+      scan_new_calls(@nd_predicate[nid])
+    end
+    if @nd_subsequent[nid] >= 0
+      scan_new_calls(@nd_subsequent[nid])
+    end
+    if @nd_else_clause[nid] >= 0
+      scan_new_calls(@nd_else_clause[nid])
+    end
+    if @nd_left[nid] >= 0
+      scan_new_calls(@nd_left[nid])
+    end
+    if @nd_right[nid] >= 0
+      scan_new_calls(@nd_right[nid])
+    end
+    if @nd_block[nid] >= 0
+      scan_new_calls(@nd_block[nid])
+    end
+    elems = parse_id_list(@nd_elements[nid])
+    k = 0
+    while k < elems.length
+      scan_new_calls(elems[k])
+      k = k + 1
+    end
+    conds = parse_id_list(@nd_conditions[nid])
+    k = 0
+    while k < conds.length
+      scan_new_calls(conds[k])
+      k = k + 1
+    end
+  end
+
+  def update_ivar_types_from_params
+    # For each class, if initialize assigns @ivar = param, update ivar type from param type
+    i = 0
+    while i < @cls_names.length
+      init_idx = cls_find_method_direct(i, "initialize")
+      if init_idx >= 0
+        all_params = @cls_meth_params[i].split("|")
+        all_ptypes = @cls_meth_ptypes[i].split("|")
+        pnames = []
+        ptypes = []
+        if init_idx < all_params.length
+          pnames = all_params[init_idx].split(",")
+        end
+        if init_idx < all_ptypes.length
+          ptypes = all_ptypes[init_idx].split(",")
+        end
+        bodies = @cls_meth_bodies[i].split(";")
+        bid = -1
+        if init_idx < bodies.length
+          bid = bodies[init_idx].to_i
+        end
+        if bid >= 0
+          stmts = get_stmts(bid)
+          k = 0
+          while k < stmts.length
+            sid = stmts[k]
+            if @nd_type[sid] == "InstanceVariableWriteNode"
+              expr = @nd_expression[sid]
+              if expr >= 0
+                if @nd_type[expr] == "LocalVariableReadNode"
+                  pname = @nd_name[expr]
+                  # Find param index
+                  pi = 0
+                  while pi < pnames.length
+                    if pnames[pi] == pname
+                      if pi < ptypes.length
+                        # Update ivar type
+                        iname = @nd_name[sid]
+                        ivar_names = @cls_ivar_names[i].split(";")
+                        ivar_types = @cls_ivar_types[i].split(";")
+                        ij = 0
+                        while ij < ivar_names.length
+                          if ivar_names[ij] == iname
+                            if ivar_types[ij] == "int"
+                              ivar_types[ij] = ptypes[pi]
+                            end
+                          end
+                          ij = ij + 1
+                        end
+                        @cls_ivar_types[i] = join_sep(ivar_types, ";")
+                      end
+                    end
+                    pi = pi + 1
+                  end
+                end
+              end
+            end
+            k = k + 1
+          end
+        end
+      end
+      i = i + 1
+    end
+  end
+
   def infer_all_returns
+    # Pre-pass: scan for .new calls to infer constructor param types
+    infer_constructor_types
+    # Update ivar types from constructor params
+    update_ivar_types_from_params
+
     # Top-level methods
     i = 0
     while i < @meth_names.length
@@ -1828,10 +2065,11 @@ class Compiler
         if j < returns.length
           returns[j] = rt
         end
+        # Save incrementally so later methods can see updated return types
+        @cls_meth_returns[i] = join_sep(returns, ";")
         pop_scope
         j = j + 1
       end
-      @cls_meth_returns[i] = join_sep(returns, ";")
 
       # Class methods
       cmnames = @cls_cmeth_names[i].split(";")
@@ -1880,6 +2118,37 @@ class Compiler
                   if @nd_name[expr] == pname
                     return cls_ivar_type(ci, @nd_name[sid])
                   end
+                end
+              end
+            end
+            # Also check super calls
+            if @nd_type[sid] == "SuperNode"
+              super_args = @nd_arguments[sid]
+              if super_args >= 0
+                sa_ids = get_args(super_args)
+                sk = 0
+                while sk < sa_ids.length
+                  if @nd_type[sa_ids[sk]] == "LocalVariableReadNode"
+                    if @nd_name[sa_ids[sk]] == pname
+                      # This param is passed to parent's initialize at position sk
+                      if @cls_parents[ci] != ""
+                        parent_ci = find_class_idx(@cls_parents[ci])
+                        if parent_ci >= 0
+                          parent_init = cls_find_method_direct(parent_ci, "initialize")
+                          if parent_init >= 0
+                            parent_ptypes = @cls_meth_ptypes[parent_ci].split("|")
+                            if parent_init < parent_ptypes.length
+                              ppt = parent_ptypes[parent_init].split(",")
+                              if sk < ppt.length
+                                return ppt[sk]
+                              end
+                            end
+                          end
+                        end
+                      end
+                    end
+                  end
+                  sk = sk + 1
                 end
               end
             end
@@ -2057,7 +2326,8 @@ class Compiler
       end
       if mname == "to_a"
         if @nd_receiver[nid] >= 0
-          if @nd_type[@nd_receiver[nid]] == "RangeNode"
+          rt = infer_type(@nd_receiver[nid])
+          if rt == "range"
             @needs_int_array = 1
             @needs_gc = 1
           end
@@ -3058,9 +3328,36 @@ class Compiler
     lnames = []
     ltypes = []
     scan_locals(bid, lnames, ltypes, params)
+    # Declare all locals first so block param inference can see them
     j = 0
     while j < lnames.length
       declare_var(lnames[j], ltypes[j])
+      j = j + 1
+    end
+    # Second pass: re-scan with types now in scope for better block param inference
+    lnames2 = []
+    ltypes2 = []
+    scan_locals(bid, lnames2, ltypes2, params)
+    # Update types that may have improved
+    j = 0
+    while j < lnames2.length
+      k = 0
+      while k < lnames.length
+        if lnames[k] == lnames2[j]
+          if ltypes[k] == "int"
+            if ltypes2[j] != "int"
+              ltypes[k] = ltypes2[j]
+              set_var_type(lnames[k], ltypes2[j])
+            end
+          end
+        end
+        k = k + 1
+      end
+      j = j + 1
+    end
+    # Emit declarations
+    j = 0
+    while j < lnames.length
       emit("  " + c_type(ltypes[j]) + " lv_" + lnames[j] + " = " + c_default_val(ltypes[j]) + ";")
       j = j + 1
     end
@@ -3121,6 +3418,19 @@ class Compiler
                   recv_type = ""
                   if @nd_receiver[nid] >= 0
                     recv_type = infer_type(@nd_receiver[nid])
+                    # If type is int and receiver is local var, check names array
+                    if recv_type == "int"
+                      if @nd_type[@nd_receiver[nid]] == "LocalVariableReadNode"
+                        rname = @nd_name[@nd_receiver[nid]]
+                        ri = 0
+                        while ri < names.length
+                          if names[ri] == rname
+                            recv_type = types[ri]
+                          end
+                          ri = ri + 1
+                        end
+                      end
+                    end
                   end
                   mname = @nd_name[nid]
                   if mname == "each"
@@ -3591,7 +3901,7 @@ class Compiler
     if recv < 0
       mi = find_method_idx(mname)
       if mi >= 0
-        return "sp_" + sanitize_name(mname) + "(" + compile_call_args(nid) + ")"
+        return "sp_" + sanitize_name(mname) + "(" + compile_call_args_with_defaults(nid, mi) + ")"
       end
       if @current_class_idx >= 0
         cidx = cls_find_method(@current_class_idx, mname)
@@ -3868,6 +4178,25 @@ class Compiler
       end
     end
 
+    # reject as expression
+    if mname == "reject"
+      if @nd_block[nid] >= 0
+        return compile_reject_expr(nid)
+      end
+    end
+
+    # reduce/inject as expression
+    if mname == "reduce"
+      if @nd_block[nid] >= 0
+        return compile_reduce_expr(nid)
+      end
+    end
+    if mname == "inject"
+      if @nd_block[nid] >= 0
+        return compile_reduce_expr(nid)
+      end
+    end
+
     # Math
     if @nd_type[recv] == "ConstantReadNode"
       if @nd_name[recv] == "Math"
@@ -3877,12 +4206,27 @@ class Compiler
       end
     end
 
-    # to_a on range
+    # to_a on range (including parenthesized range)
     if mname == "to_a"
+      range_nid = -1
       if @nd_type[recv] == "RangeNode"
+        range_nid = recv
+      end
+      if @nd_type[recv] == "ParenthesesNode"
+        pb = @nd_body[recv]
+        if pb >= 0
+          pstmts = get_stmts(pb)
+          if pstmts.length > 0
+            if @nd_type[pstmts[0]] == "RangeNode"
+              range_nid = pstmts[0]
+            end
+          end
+        end
+      end
+      if range_nid >= 0
         @needs_int_array = 1
         @needs_gc = 1
-        return "sp_IntArray_from_range(" + compile_expr(@nd_left[recv]) + ", " + compile_expr(@nd_right[recv]) + ")"
+        return "sp_IntArray_from_range(" + compile_expr(@nd_left[range_nid]) + ", " + compile_expr(@nd_right[range_nid]) + ")"
       end
     end
 
@@ -3982,6 +4326,40 @@ class Compiler
       end
     end
     "(" + lc + " " + op + " " + rc + ")"
+  end
+
+  def compile_call_args_with_defaults(nid, mi)
+    args_id = @nd_arguments[nid]
+    arg_ids = []
+    if args_id >= 0
+      arg_ids = get_args(args_id)
+    end
+    pnames = @meth_param_names[mi].split(",")
+    defaults = @meth_has_defaults[mi].split(",")
+    result = ""
+    k = 0
+    while k < pnames.length
+      if k > 0
+        result = result + ", "
+      end
+      if k < arg_ids.length
+        result = result + compile_expr(arg_ids[k])
+      else
+        # Use default value
+        if k < defaults.length
+          def_id = defaults[k].to_i
+          if def_id >= 0
+            result = result + compile_expr(def_id)
+          else
+            result = result + "0"
+          end
+        else
+          result = result + "0"
+        end
+      end
+      k = k + 1
+    end
+    result
   end
 
   def compile_call_args(nid)
@@ -4873,6 +5251,16 @@ class Compiler
     @in_loop = old
   end
 
+  def compile_reduce_expr(nid)
+    # Emit the reduce loop as side effects, return accumulator
+    compile_reduce_block(nid)
+    bp1 = get_block_param(nid, 0)
+    if bp1 == ""
+      bp1 = "_acc"
+    end
+    "lv_" + bp1
+  end
+
   def compile_reduce_block(nid)
     rc = compile_expr(@nd_receiver[nid])
     init_val = compile_arg0(nid)
@@ -4906,6 +5294,40 @@ class Compiler
       @indent = @indent - 1
       emit("  }")
     end
+  end
+
+  def compile_reject_expr(nid)
+    rc = compile_expr(@nd_receiver[nid])
+    bp1 = get_block_param(nid, 0)
+    if bp1 == ""
+      bp1 = "_x"
+    end
+    rt = infer_type(@nd_receiver[nid])
+    if rt == "int_array"
+      @needs_int_array = 1
+      tmp_arr = new_temp
+      emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
+      tmp_i = new_temp
+      emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
+      emit("    lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
+      @indent = @indent + 1
+      blk = @nd_block[nid]
+      if blk >= 0
+        body = @nd_body[blk]
+        if body >= 0
+          stmts = get_stmts(body)
+          if stmts.length > 0
+            last = stmts[stmts.length - 1]
+            cond = compile_expr(last)
+            emit("  if (!(" + cond + ")) sp_IntArray_push(" + tmp_arr + ", lv_" + bp1 + ");")
+          end
+        end
+      end
+      @indent = @indent - 1
+      emit("  }")
+      return tmp_arr
+    end
+    "0"
   end
 
   def compile_reject_block(nid)
