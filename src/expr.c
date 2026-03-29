@@ -54,6 +54,9 @@ static char *codegen_expr_call(codegen_ctx_t *ctx, pm_call_node_t *call, pm_node
       if (blk->body) {
         pm_statements_node_t *stmts = (pm_statements_node_t *)blk->body;
         if (stmts->body.size > 0) {
+          /* Compile all statements before the last one */
+          for (size_t si = 0; si + 1 < stmts->body.size; si++)
+            codegen_stmt(ctx, stmts->body.nodes[si]);
           char *val = codegen_expr(ctx, stmts->body.nodes[stmts->body.size - 1]);
           emit(ctx, "sp_IntArray_push(_tmap_%d, %s);\n", tmp, val);
           free(val);
@@ -4940,6 +4943,11 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
           free(else_e);
           else_e = codegen_expr(ctx, el->statements->body.nodes[0]);
         }
+      }
+      else if (PM_NODE_TYPE(n->subsequent) == PM_IF_NODE) {
+        /* elsif chain → nested ternary */
+        free(else_e);
+        else_e = codegen_expr(ctx, n->subsequent);
       }
     }
     char *r = sfmt("(%s ? %s : %s)", cond, then_e, else_e);
