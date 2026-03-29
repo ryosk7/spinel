@@ -108,6 +108,15 @@ class Compiler
     @current_method_return = ""
     @in_main = 0
     @in_loop = 0
+    @in_yield_method = 0
+
+    # Yield/block tracking (parallel with meth_names / cls_meth_names)
+    @meth_has_yield = []
+    @cls_meth_has_yield = "".split(",")
+
+    # Block function accumulator (emitted before forward decls)
+    @block_funcs = ""
+    @block_counter = 0
 
     # Feature flags
     @needs_gc = 0
@@ -116,6 +125,10 @@ class Compiler
     @needs_str_int_hash = 0
     @needs_str_str_hash = 0
     @needs_string_helpers = 0
+    @needs_setjmp = 0
+    @needs_file_io = 0
+    @needs_mutable_str = 0
+    @needs_rb_value = 0
   end
 
   def join_sep(arr, sep)
@@ -1020,6 +1033,18 @@ class Compiler
       end
       return "int_array"
     end
+    if mname == "map"
+      if recv >= 0
+        return infer_type(recv)
+      end
+      return "int_array"
+    end
+    if mname == "select"
+      if recv >= 0
+        return infer_type(recv)
+      end
+      return "int_array"
+    end
     if mname == "[]"
       if recv >= 0
         rt = infer_type(recv)
@@ -1316,6 +1341,7 @@ class Compiler
     @cls_cmeth_ptypes.push("")
     @cls_cmeth_returns.push("")
     @cls_cmeth_bodies.push("")
+    @cls_meth_has_yield.push("")
     @needs_gc = 1
 
     # Collect class body
@@ -1359,7 +1385,14 @@ class Compiler
     params_str = collect_params_str(nid)
     ptypes_str = collect_ptypes_str(nid, ci)
     defaults_str = collect_defaults_str(nid)
+    has_y = body_has_yield(body_id)
     append_cls_meth(ci, mname, params_str, ptypes_str, "int", body_id, defaults_str)
+    # Track yield info
+    if @cls_meth_has_yield[ci] != ""
+      @cls_meth_has_yield[ci] = @cls_meth_has_yield[ci] + ";" + has_y.to_s
+    else
+      @cls_meth_has_yield[ci] = has_y.to_s
+    end
     return
   end
 
@@ -1701,7 +1734,14 @@ class Compiler
       return infer_hash_val_type(nid)
     end
     if t == "CallNode"
-      if @nd_name[nid] == "new"
+      mname = @nd_name[nid]
+      if mname == "to_a"
+        return "int_array"
+      end
+      if mname == "split"
+        return "str_array"
+      end
+      if mname == "new"
         r = @nd_receiver[nid]
         if r >= 0
           if @nd_type[r] == "ConstantReadNode"
@@ -1760,6 +1800,7 @@ class Compiler
     @meth_return_types.push("int")
     @meth_body_ids.push(body_id)
     @meth_has_defaults.push(defaults_str)
+    @meth_has_yield.push(body_has_yield(body_id))
   end
 
   def collect_constant(nid)
@@ -1771,6 +1812,105 @@ class Compiler
     end
     @const_types.push(ct)
     @const_expr_ids.push(expr_id)
+  end
+
+  # ---- Yield detection ----
+  def body_has_yield(nid)
+    if nid < 0
+      return 0
+    end
+    if @nd_type[nid] == "YieldNode"
+      return 1
+    end
+    if @nd_type[nid] == "CallNode"
+      if @nd_name[nid] == "block_given?"
+        return 1
+      end
+    end
+    # Don't recurse into nested DefNode (that's a different method)
+    if @nd_type[nid] == "DefNode"
+      return 0
+    end
+    if @nd_type[nid] == "BlockNode"
+      # Don't look inside blocks of other calls for yield
+      # Actually we do - yield inside a block still belongs to enclosing method
+    end
+    # Recurse children
+    if @nd_body[nid] >= 0
+      if body_has_yield(@nd_body[nid]) == 1
+        return 1
+      end
+    end
+    stmts = parse_id_list(@nd_stmts[nid])
+    k = 0
+    while k < stmts.length
+      if body_has_yield(stmts[k]) == 1
+        return 1
+      end
+      k = k + 1
+    end
+    if @nd_expression[nid] >= 0
+      if body_has_yield(@nd_expression[nid]) == 1
+        return 1
+      end
+    end
+    if @nd_predicate[nid] >= 0
+      if body_has_yield(@nd_predicate[nid]) == 1
+        return 1
+      end
+    end
+    if @nd_subsequent[nid] >= 0
+      if body_has_yield(@nd_subsequent[nid]) == 1
+        return 1
+      end
+    end
+    if @nd_else_clause[nid] >= 0
+      if body_has_yield(@nd_else_clause[nid]) == 1
+        return 1
+      end
+    end
+    if @nd_left[nid] >= 0
+      if body_has_yield(@nd_left[nid]) == 1
+        return 1
+      end
+    end
+    if @nd_right[nid] >= 0
+      if body_has_yield(@nd_right[nid]) == 1
+        return 1
+      end
+    end
+    if @nd_block[nid] >= 0
+      if body_has_yield(@nd_block[nid]) == 1
+        return 1
+      end
+    end
+    conds = parse_id_list(@nd_conditions[nid])
+    k = 0
+    while k < conds.length
+      if body_has_yield(conds[k]) == 1
+        return 1
+      end
+      k = k + 1
+    end
+    args = parse_id_list(@nd_args[nid])
+    k = 0
+    while k < args.length
+      if body_has_yield(args[k]) == 1
+        return 1
+      end
+      k = k + 1
+    end
+    if @nd_arguments[nid] >= 0
+      if body_has_yield(@nd_arguments[nid]) == 1
+        return 1
+      end
+    end
+    if @nd_receiver[nid] >= 0
+      if body_has_yield(@nd_receiver[nid]) == 1
+        return 1
+      end
+    end
+    0
   end
 
   # ---- Return type inference ----
@@ -2458,8 +2598,41 @@ class Compiler
   end
 
   # ---- Code generation ----
+  def infer_main_call_types
+    # Scan main-level code for function calls and infer param types from arguments
+    stmts = get_body_stmts(@root_id)
+    # First, figure out main local types
+    push_scope
+    lnames = "".split(",")
+    ltypes = "".split(",")
+    empty_p = "".split(",")
+    i = 0
+    while i < stmts.length
+      sid = stmts[i]
+      if @nd_type[sid] != "DefNode"
+        if @nd_type[sid] != "ClassNode"
+          if @nd_type[sid] != "ConstantWriteNode"
+            scan_locals(sid, lnames, ltypes, empty_p)
+          end
+        end
+      end
+      i = i + 1
+    end
+    k = 0
+    while k < lnames.length
+      declare_var(lnames[k], ltypes[k])
+      k = k + 1
+    end
+    # Now scan call sites to update param types
+    scan_new_calls(@root_id)
+    pop_scope
+  end
+
   def compile
     collect_all
+    infer_main_call_types
+    # Re-infer return types after main call type fixes
+    infer_all_returns
     detect_features
     generate_code
   end
@@ -2740,10 +2913,18 @@ class Compiler
 
   # ---- Forward declarations ----
   def emit_forward_decls
+    # Emit block helper functions accumulated during collection
+    if @block_funcs != ""
+      emit_raw(@block_funcs)
+    end
     # Top-level methods
     i = 0
     while i < @meth_names.length
-      emit_raw("static " + c_type(@meth_return_types[i]) + " sp_" + sanitize_name(@meth_names[i]) + "(" + method_params_decl(i) + ");")
+      yp = ""
+      if @meth_has_yield[i] == 1
+        yp = yield_params_suffix(i)
+      end
+      emit_raw("static " + c_type(@meth_return_types[i]) + " sp_" + sanitize_name(@meth_names[i]) + "(" + method_params_decl(i) + yp + ");")
       i = i + 1
     end
     # Class methods
@@ -2768,7 +2949,11 @@ class Compiler
           if j < returns.length
             rt = returns[j]
           end
-          emit_raw("static " + c_type(rt) + " sp_" + cname + "_" + sanitize_name(mnames[j]) + "(sp_" + cname + " *self" + method_with_self_params(j, all_params, all_ptypes) + ");")
+          yp = ""
+          if cls_method_has_yield(i, j) == 1
+            yp = yield_params_suffix_cls(i, j)
+          end
+          emit_raw("static " + c_type(rt) + " sp_" + cname + "_" + sanitize_name(mnames[j]) + "(sp_" + cname + " *self" + method_with_self_params(j, all_params, all_ptypes) + yp + ");")
         end
         j = j + 1
       end
@@ -2789,6 +2974,29 @@ class Compiler
       i = i + 1
     end
     emit_raw("")
+  end
+
+  def yield_params_suffix(mi)
+    pnames = @meth_param_names[mi].split(",")
+    if pnames.length == 0
+      return "void (*_block)(mrb_int, void*), void *_benv"
+    end
+    return ", void (*_block)(mrb_int, void*), void *_benv"
+  end
+
+  def yield_params_suffix_cls(ci, midx)
+    # For class instance methods (always have self first)
+    return ", void (*_block)(mrb_int, void*), void *_benv"
+  end
+
+  def cls_method_has_yield(ci, midx)
+    ystr = @cls_meth_has_yield[ci].split(";")
+    if midx < ystr.length
+      if ystr[midx] == "1"
+        return 1
+      end
+    end
+    0
   end
 
   def cls_find_method_direct(ci, mname)
@@ -3188,7 +3396,20 @@ class Compiler
     @current_method_return = rt
     @indent = 1
 
-    emit_raw("static " + c_type(rt) + " sp_" + cname + "_" + sanitize_name(mname) + "(sp_" + cname + " *self" + build_params_str(pnames, ptypes) + ") {")
+    midx = cls_find_method_direct(ci, mname)
+    if midx >= 0
+      if cls_method_has_yield(ci, midx) == 1
+        @in_yield_method = 1
+      else
+        @in_yield_method = 0
+      end
+    end
+
+    yp = ""
+    if @in_yield_method == 1
+      yp = yield_params_suffix_cls(ci, midx)
+    end
+    emit_raw("static " + c_type(rt) + " sp_" + cname + "_" + sanitize_name(mname) + "(sp_" + cname + " *self" + build_params_str(pnames, ptypes) + yp + ") {")
 
     push_scope
     j = 0
@@ -3209,6 +3430,7 @@ class Compiler
     pop_scope
     @current_class_idx = -1
     @current_method_name = ""
+    @in_yield_method = 0
     @indent = 0
     emit_raw("}")
     emit_raw("")
@@ -3295,11 +3517,20 @@ class Compiler
     @current_method_return = @meth_return_types[mi]
     @indent = 1
     @in_main = 0
+    if @meth_has_yield[mi] == 1
+      @in_yield_method = 1
+    else
+      @in_yield_method = 0
+    end
 
     pnames = @meth_param_names[mi].split(",")
     ptypes = @meth_param_types[mi].split(",")
 
-    emit_raw("static " + c_type(@meth_return_types[mi]) + " sp_" + sanitize_name(@meth_names[mi]) + "(" + method_params_decl(mi) + ") {")
+    yp = ""
+    if @meth_has_yield[mi] == 1
+      yp = yield_params_suffix(mi)
+    end
+    emit_raw("static " + c_type(@meth_return_types[mi]) + " sp_" + sanitize_name(@meth_names[mi]) + "(" + method_params_decl(mi) + yp + ") {")
 
     push_scope
     j = 0
@@ -3320,6 +3551,7 @@ class Compiler
 
     pop_scope
     @current_method_name = ""
+    @in_yield_method = 0
     @indent = 0
     emit_raw("}")
     emit_raw("")
@@ -3901,9 +4133,19 @@ class Compiler
 
     # No receiver
     if recv < 0
+      if mname == "block_given?"
+        if @in_yield_method == 1
+          return "(_block != NULL)"
+        end
+        return "0"
+      end
       mi = find_method_idx(mname)
       if mi >= 0
-        return "sp_" + sanitize_name(mname) + "(" + compile_call_args_with_defaults(nid, mi) + ")"
+        yargs = ""
+        if @meth_has_yield[mi] == 1
+          yargs = ", NULL, NULL"
+        end
+        return "sp_" + sanitize_name(mname) + "(" + compile_call_args_with_defaults(nid, mi) + yargs + ")"
       end
       if @current_class_idx >= 0
         cidx = cls_find_method(@current_class_idx, mname)
@@ -4177,6 +4419,20 @@ class Compiler
       end
       if mname == "keys"
         return "sp_StrStrHash_keys(" + rc + ")"
+      end
+    end
+
+    # map as expression
+    if mname == "map"
+      if @nd_block[nid] >= 0
+        return compile_map_expr(nid)
+      end
+    end
+
+    # select as expression
+    if mname == "select"
+      if @nd_block[nid] >= 0
+        return compile_select_expr(nid)
       end
     end
 
@@ -4599,6 +4855,10 @@ class Compiler
       emit("  continue;")
       return
     end
+    if t == "YieldNode"
+      compile_yield_stmt(nid)
+      return
+    end
     if t == "CallNode"
       compile_call_stmt(nid)
       return
@@ -4906,8 +5166,19 @@ class Compiler
     # each with block
     if mname == "each"
       if @nd_block[nid] >= 0
-        compile_each_block(nid)
-        return
+        # For object types with yield-using each, use yield method call
+        if recv >= 0
+          ert = infer_type(recv)
+          if is_obj_type(ert) == 1
+            # Fall through to yield method handler below
+          else
+            compile_each_block(nid)
+            return
+          end
+        else
+          compile_each_block(nid)
+          return
+        end
       end
     end
 
@@ -4987,6 +5258,65 @@ class Compiler
             rc = compile_expr(recv)
             emit("  " + rc + "->" + bname + " = " + compile_arg0(nid) + ";")
             return
+          end
+        end
+      end
+    end
+
+    # map with block
+    if mname == "map"
+      if @nd_block[nid] >= 0
+        compile_map_block(nid)
+        return
+      end
+    end
+
+    # select with block
+    if mname == "select"
+      if @nd_block[nid] >= 0
+        compile_select_block(nid)
+        return
+      end
+    end
+
+    # User-defined yield function called with block
+    if @nd_block[nid] >= 0
+      if recv < 0
+        mi = find_method_idx(mname)
+        if mi >= 0
+          if @meth_has_yield[mi] == 1
+            compile_yield_call_stmt(nid, mi)
+            return
+          end
+        end
+      end
+      # Class method with yield
+      if recv >= 0
+        rtype = infer_type(recv)
+        if is_obj_type(rtype) == 1
+          cn = rtype[4, rtype.length - 4]
+          cci = find_class_idx(cn)
+          if cci >= 0
+            midx = cls_find_method_direct(cci, mname)
+            if midx >= 0
+              if cls_method_has_yield(cci, midx) == 1
+                compile_yield_method_call_stmt(nid, cci, midx, mname)
+                return
+              end
+            end
+            # Check parent
+            if @cls_parents[cci] != ""
+              pci = find_class_idx(@cls_parents[cci])
+              if pci >= 0
+                pidx = cls_find_method_direct(pci, mname)
+                if pidx >= 0
+                  if cls_method_has_yield(pci, pidx) == 1
+                    compile_yield_method_call_stmt(nid, pci, pidx, mname)
+                    return
+                  end
+                end
+              end
+            end
           end
         end
       end
@@ -5254,6 +5584,81 @@ class Compiler
     @in_loop = old
   end
 
+  def compile_map_expr(nid)
+    # Emit the map loop as side effects, return result array
+    compile_map_block(nid)
+    # The map_block stores result in a temp - we need to return it
+    # Actually, compile_map_block emits into current output but doesn't return the temp name.
+    # Let's use a different approach: inline and return temp
+    rt = infer_type(@nd_receiver[nid])
+    rc = compile_expr(@nd_receiver[nid])
+    bp1 = get_block_param(nid, 0)
+    if bp1 == ""
+      bp1 = "_x"
+    end
+    tmp_arr = new_temp
+    tmp_i = new_temp
+    if rt == "int_array"
+      @needs_int_array = 1
+      @needs_gc = 1
+      emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
+      emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
+      emit("    lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
+      @indent = @indent + 1
+      blk = @nd_block[nid]
+      if blk >= 0
+        body = @nd_body[blk]
+        if body >= 0
+          stmts = get_stmts(body)
+          if stmts.length > 0
+            last = stmts[stmts.length - 1]
+            val = compile_expr(last)
+            emit("  sp_IntArray_push(" + tmp_arr + ", " + val + ");")
+          end
+        end
+      end
+      @indent = @indent - 1
+      emit("  }")
+      return tmp_arr
+    end
+    "0"
+  end
+
+  def compile_select_expr(nid)
+    rt = infer_type(@nd_receiver[nid])
+    rc = compile_expr(@nd_receiver[nid])
+    bp1 = get_block_param(nid, 0)
+    if bp1 == ""
+      bp1 = "_x"
+    end
+    tmp_arr = new_temp
+    tmp_i = new_temp
+    if rt == "int_array"
+      @needs_int_array = 1
+      @needs_gc = 1
+      emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
+      emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
+      emit("    lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
+      @indent = @indent + 1
+      blk = @nd_block[nid]
+      if blk >= 0
+        body = @nd_body[blk]
+        if body >= 0
+          stmts = get_stmts(body)
+          if stmts.length > 0
+            last = stmts[stmts.length - 1]
+            cond = compile_expr(last)
+            emit("  if (" + cond + ") sp_IntArray_push(" + tmp_arr + ", lv_" + bp1 + ");")
+          end
+        end
+      end
+      @indent = @indent - 1
+      emit("  }")
+      return tmp_arr
+    end
+    "0"
+  end
+
   def compile_reduce_expr(nid)
     # Emit the reduce loop as side effects, return accumulator
     compile_reduce_block(nid)
@@ -5365,6 +5770,695 @@ class Compiler
     end
   end
 
+  def compile_yield_stmt(nid)
+    args_id = @nd_arguments[nid]
+    arg_exprs = ""
+    if args_id >= 0
+      aids = get_args(args_id)
+      k = 0
+      while k < aids.length
+        if k > 0
+          arg_exprs = arg_exprs + ", "
+        end
+        arg_exprs = arg_exprs + compile_expr(aids[k])
+        k = k + 1
+      end
+    end
+    if arg_exprs != ""
+      emit("  if (_block) _block(" + arg_exprs + ", _benv);")
+    else
+      emit("  if (_block) _block(0, _benv);")
+    end
+  end
+
+  def compile_yield_call_stmt(nid, mi)
+    # Call a yield-using top-level function with a block
+    # Inline the function body, replacing yield with block body
+    blk = @nd_block[nid]
+    if blk < 0
+      return
+    end
+
+    # Get block params
+    bp_names = "".split(",")
+    bp = @nd_parameters[blk]
+    if bp >= 0
+      inner = @nd_parameters[bp]
+      if inner >= 0
+        reqs = parse_id_list(@nd_requireds[inner])
+        k = 0
+        while k < reqs.length
+          bp_names.push(@nd_name[reqs[k]])
+          k = k + 1
+        end
+      end
+    end
+
+    args_id = @nd_arguments[nid]
+    arg_ids = []
+    if args_id >= 0
+      arg_ids = get_args(args_id)
+    end
+
+    # Declare and set the function's params as new temp vars
+    pnames = @meth_param_names[mi].split(",")
+    ptypes = @meth_param_types[mi].split(",")
+    # Create unique temp names for function params to avoid collision
+    @block_counter = @block_counter + 1
+    suffix = "_y" + @block_counter.to_s
+    param_map_from = "".split(",")
+    param_map_to = "".split(",")
+    k = 0
+    while k < pnames.length
+      pt = "int"
+      if k < ptypes.length
+        pt = ptypes[k]
+      end
+      tname = pnames[k] + suffix
+      val = "0"
+      if k < arg_ids.length
+        val = compile_expr(arg_ids[k])
+      end
+      emit("  " + c_type(pt) + " lv_" + tname + " = " + val + ";")
+      param_map_from.push(pnames[k])
+      param_map_to.push(tname)
+      declare_var(tname, pt)
+      k = k + 1
+    end
+
+    # Also need to declare the function's local vars
+    bid = @meth_body_ids[mi]
+    if bid >= 0
+      flocals_n = "".split(",")
+      flocals_t = "".split(",")
+      scan_locals(bid, flocals_n, flocals_t, pnames)
+      k = 0
+      while k < flocals_n.length
+        tname = flocals_n[k] + suffix
+        emit("  " + c_type(flocals_t[k]) + " lv_" + tname + " = " + c_default_val(flocals_t[k]) + ";")
+        param_map_from.push(flocals_n[k])
+        param_map_to.push(tname)
+        declare_var(tname, flocals_t[k])
+        k = k + 1
+      end
+    end
+
+    # Compile function body, replacing yield with block body
+    # and renaming function locals to temp names
+    if bid >= 0
+      stmts = get_stmts(bid)
+      k = 0
+      while k < stmts.length
+        compile_stmt_with_block(stmts[k], blk, bp_names, param_map_from, param_map_to)
+        k = k + 1
+      end
+    end
+  end
+
+  def compile_stmt_with_block(nid, blk, bp_names, map_from, map_to)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "YieldNode"
+      # Replace yield with the block body
+      args_id = @nd_arguments[nid]
+      if args_id >= 0
+        aids = get_args(args_id)
+        k = 0
+        while k < aids.length
+          if k < bp_names.length
+            emit("  lv_" + bp_names[k] + " = " + compile_expr_remap(aids[k], map_from, map_to) + ";")
+          end
+          k = k + 1
+        end
+      end
+      body = @nd_body[blk]
+      if body >= 0
+        stmts = get_stmts(body)
+        sk = 0
+        while sk < stmts.length
+          compile_stmt(stmts[sk])
+          sk = sk + 1
+        end
+      end
+      return
+    end
+    if t == "LocalVariableWriteNode"
+      lname = @nd_name[nid]
+      rname = remap_local(lname, map_from, map_to)
+      val = compile_expr_remap(@nd_expression[nid], map_from, map_to)
+      emit("  lv_" + rname + " = " + val + ";")
+      return
+    end
+    if t == "LocalVariableOperatorWriteNode"
+      lname = @nd_name[nid]
+      rname = remap_local(lname, map_from, map_to)
+      op = @nd_binop[nid]
+      val = compile_expr_remap(@nd_expression[nid], map_from, map_to)
+      if op == "+"
+        emit("  lv_" + rname + " += " + val + ";")
+      end
+      if op == "-"
+        emit("  lv_" + rname + " -= " + val + ";")
+      end
+      if op == "*"
+        emit("  lv_" + rname + " *= " + val + ";")
+      end
+      return
+    end
+    if t == "WhileNode"
+      old = @in_loop
+      @in_loop = 1
+      cond = compile_expr_remap(@nd_predicate[nid], map_from, map_to)
+      emit("  while (" + cond + ") {")
+      @indent = @indent + 1
+      body = @nd_body[nid]
+      if body >= 0
+        stmts = get_stmts(body)
+        sk = 0
+        while sk < stmts.length
+          compile_stmt_with_block(stmts[sk], blk, bp_names, map_from, map_to)
+          sk = sk + 1
+        end
+      end
+      @indent = @indent - 1
+      emit("  }")
+      @in_loop = old
+      return
+    end
+    if t == "IfNode"
+      cond = compile_expr_remap(@nd_predicate[nid], map_from, map_to)
+      emit("  if (" + cond + ") {")
+      @indent = @indent + 1
+      body = @nd_body[nid]
+      if body >= 0
+        stmts = get_stmts(body)
+        sk = 0
+        while sk < stmts.length
+          compile_stmt_with_block(stmts[sk], blk, bp_names, map_from, map_to)
+          sk = sk + 1
+        end
+      end
+      @indent = @indent - 1
+      sub = @nd_subsequent[nid]
+      if sub >= 0
+        if @nd_type[sub] == "ElseNode"
+          emit("  } else {")
+          @indent = @indent + 1
+          eb = @nd_body[sub]
+          if eb >= 0
+            estmts = get_stmts(eb)
+            sk = 0
+            while sk < estmts.length
+              compile_stmt_with_block(estmts[sk], blk, bp_names, map_from, map_to)
+              sk = sk + 1
+            end
+          end
+          @indent = @indent - 1
+        else
+          emit("  } else")
+          compile_stmt_with_block(sub, blk, bp_names, map_from, map_to)
+          return
+        end
+      end
+      emit("  }")
+      return
+    end
+    if t == "CallNode"
+      # Check if block_given? with remap
+      if @nd_name[nid] == "block_given?"
+        if @nd_receiver[nid] < 0
+          # In inlined context, block IS given, do nothing
+          return
+        end
+      end
+      # Handle nested each/times with yield inside block
+      if @nd_block[nid] >= 0
+        mname2 = @nd_name[nid]
+        if mname2 == "each"
+          # Compile the each loop, but inside the block body, recurse with yield replacement
+          compile_each_with_yield_inline(nid, blk, bp_names, map_from, map_to)
+          return
+        end
+      end
+      # Compile call with remapping for args
+      val = compile_expr_remap(nid, map_from, map_to)
+      if val != "0"
+        emit("  " + val + ";")
+      end
+      return
+    end
+    if t == "ReturnNode"
+      # In inlined context, return becomes a value assignment
+      # but for simplicity, just skip
+      return
+    end
+    # Default: for expression statements, use remap
+    val = compile_expr_remap(nid, map_from, map_to)
+    if val != "0"
+      emit("  " + val + ";")
+    end
+  end
+
+  def remap_local(name, map_from, map_to)
+    k = 0
+    while k < map_from.length
+      if map_from[k] == name
+        return map_to[k]
+      end
+      k = k + 1
+    end
+    name
+  end
+
+  def compile_expr_remap(nid, map_from, map_to)
+    if nid < 0
+      return "0"
+    end
+    t = @nd_type[nid]
+    if t == "LocalVariableReadNode"
+      rname = remap_local(@nd_name[nid], map_from, map_to)
+      return "lv_" + rname
+    end
+    if t == "InstanceVariableReadNode"
+      # Remap self to the _yself variable
+      self_name = remap_local("_self_", map_from, map_to)
+      return self_name + "->" + sanitize_ivar(@nd_name[nid])
+    end
+    if t == "SelfNode"
+      return remap_local("_self_", map_from, map_to)
+    end
+    if t == "CallNode"
+      if @nd_name[nid] == "block_given?"
+        if @nd_receiver[nid] < 0
+          return "1"
+        end
+      end
+      # For operators with remapped locals
+      mname = @nd_name[nid]
+      recv = @nd_receiver[nid]
+      if recv >= 0
+        if mname == "+"
+          return "(" + compile_expr_remap(recv, map_from, map_to) + " + " + compile_expr_remap_arg0(nid, map_from, map_to) + ")"
+        end
+        if mname == "-"
+          args_id = @nd_arguments[nid]
+          if args_id < 0
+            return "(-" + compile_expr_remap(recv, map_from, map_to) + ")"
+          end
+          return "(" + compile_expr_remap(recv, map_from, map_to) + " - " + compile_expr_remap_arg0(nid, map_from, map_to) + ")"
+        end
+        if mname == "*"
+          return "(" + compile_expr_remap(recv, map_from, map_to) + " * " + compile_expr_remap_arg0(nid, map_from, map_to) + ")"
+        end
+        if mname == "/"
+          return "(" + compile_expr_remap(recv, map_from, map_to) + " / " + compile_expr_remap_arg0(nid, map_from, map_to) + ")"
+        end
+        if mname == "%"
+          return "sp_imod(" + compile_expr_remap(recv, map_from, map_to) + ", " + compile_expr_remap_arg0(nid, map_from, map_to) + ")"
+        end
+        if mname == "<"
+          return "(" + compile_expr_remap(recv, map_from, map_to) + " < " + compile_expr_remap_arg0(nid, map_from, map_to) + ")"
+        end
+        if mname == ">"
+          return "(" + compile_expr_remap(recv, map_from, map_to) + " > " + compile_expr_remap_arg0(nid, map_from, map_to) + ")"
+        end
+        if mname == "<="
+          return "(" + compile_expr_remap(recv, map_from, map_to) + " <= " + compile_expr_remap_arg0(nid, map_from, map_to) + ")"
+        end
+        if mname == ">="
+          return "(" + compile_expr_remap(recv, map_from, map_to) + " >= " + compile_expr_remap_arg0(nid, map_from, map_to) + ")"
+        end
+        if mname == "=="
+          return "(" + compile_expr_remap(recv, map_from, map_to) + " == " + compile_expr_remap_arg0(nid, map_from, map_to) + ")"
+        end
+        if mname == "!="
+          return "(" + compile_expr_remap(recv, map_from, map_to) + " != " + compile_expr_remap_arg0(nid, map_from, map_to) + ")"
+        end
+      end
+    end
+    # Fallback: compile normally
+    compile_expr(nid)
+  end
+
+  def compile_expr_remap_arg0(nid, map_from, map_to)
+    args_id = @nd_arguments[nid]
+    if args_id >= 0
+      arg_ids = get_args(args_id)
+      if arg_ids.length > 0
+        return compile_expr_remap(arg_ids[0], map_from, map_to)
+      end
+    end
+    "0"
+  end
+
+  def compile_yield_method_call_stmt(nid, cci, midx, mname)
+    # Call a yield-using class method with a block - inline the method body
+    blk = @nd_block[nid]
+    if blk < 0
+      return
+    end
+    bp_names = "".split(",")
+    bp = @nd_parameters[blk]
+    if bp >= 0
+      inner = @nd_parameters[bp]
+      if inner >= 0
+        reqs = parse_id_list(@nd_requireds[inner])
+        k = 0
+        while k < reqs.length
+          bp_names.push(@nd_name[reqs[k]])
+          k = k + 1
+        end
+      end
+    end
+
+    recv = @nd_receiver[nid]
+    rc = compile_expr(recv)
+
+    bodies = @cls_meth_bodies[cci].split(";")
+    bid = -1
+    if midx < bodies.length
+      bid = bodies[midx].to_i
+    end
+
+    saved_ci = @current_class_idx
+    @current_class_idx = cci
+
+    cname = @cls_names[cci]
+    @block_counter = @block_counter + 1
+    suffix = "_y" + @block_counter.to_s
+
+    # For the method params and locals, create remapped names
+    all_params = @cls_meth_params[cci].split("|")
+    all_ptypes = @cls_meth_ptypes[cci].split("|")
+    pnames = "".split(",")
+    ptypes = "".split(",")
+    if midx < all_params.length
+      pnames = all_params[midx].split(",")
+    end
+    if midx < all_ptypes.length
+      ptypes = all_ptypes[midx].split(",")
+    end
+
+    map_from = "".split(",")
+    map_to = "".split(",")
+
+    # Map self to the receiver expression
+    map_from.push("_self_")
+    map_to.push(rc)
+
+    args_id = @nd_arguments[nid]
+    arg_ids = []
+    if args_id >= 0
+      arg_ids = get_args(args_id)
+    end
+
+    k = 0
+    while k < pnames.length
+      pt = "int"
+      if k < ptypes.length
+        pt = ptypes[k]
+      end
+      tname = pnames[k] + suffix
+      val = "0"
+      if k < arg_ids.length
+        val = compile_expr(arg_ids[k])
+      end
+      emit("  " + c_type(pt) + " lv_" + tname + " = " + val + ";")
+      map_from.push(pnames[k])
+      map_to.push(tname)
+      declare_var(tname, pt)
+      k = k + 1
+    end
+
+    # Declare function locals
+    if bid >= 0
+      flocals_n = "".split(",")
+      flocals_t = "".split(",")
+      scan_locals(bid, flocals_n, flocals_t, pnames)
+      k = 0
+      while k < flocals_n.length
+        tname = flocals_n[k] + suffix
+        emit("  " + c_type(flocals_t[k]) + " lv_" + tname + " = " + c_default_val(flocals_t[k]) + ";")
+        map_from.push(flocals_n[k])
+        map_to.push(tname)
+        declare_var(tname, flocals_t[k])
+        k = k + 1
+      end
+    end
+
+    # Compile the method body inline with yield -> block body
+    if bid >= 0
+      stmts = get_stmts(bid)
+      k = 0
+      while k < stmts.length
+        compile_stmt_with_block(stmts[k], blk, bp_names, map_from, map_to)
+        k = k + 1
+      end
+    end
+
+    @current_class_idx = saved_ci
+  end
+
+  def compile_each_with_yield_inline(nid, outer_blk, outer_bp_names, map_from, map_to)
+    # An each call on an array inside an inlined yield function
+    # The each block contains yield statements that should be replaced with outer block body
+    recv = @nd_receiver[nid]
+    recv_expr = compile_expr_remap(recv, map_from, map_to)
+    rt = infer_type(recv)
+    # If recv is remapped, get the actual type
+    if @nd_type[recv] == "InstanceVariableReadNode"
+      if @current_class_idx >= 0
+        rt = cls_ivar_type(@current_class_idx, @nd_name[recv])
+      end
+    end
+
+    inner_bp1 = get_block_param(nid, 0)
+    if inner_bp1 == ""
+      inner_bp1 = "_ex"
+    end
+    # The inner block param might collide with outer names, so remap it
+    inner_bp_remapped = remap_local(inner_bp1, map_from, map_to)
+
+    old = @in_loop
+    @in_loop = 1
+    tmp = new_temp
+
+    if rt == "int_array"
+      emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < sp_IntArray_length(" + recv_expr + "); " + tmp + "++) {")
+      emit("    lv_" + inner_bp_remapped + " = sp_IntArray_get(" + recv_expr + ", " + tmp + ");")
+      @indent = @indent + 1
+      # Compile inner block body, replacing yield with outer block body
+      inner_blk = @nd_block[nid]
+      if inner_blk >= 0
+        ibody = @nd_body[inner_blk]
+        if ibody >= 0
+          istmts = get_stmts(ibody)
+          sk = 0
+          while sk < istmts.length
+            # In the inner block, yield should be replaced with outer block body
+            inner_nid = istmts[sk]
+            if @nd_type[inner_nid] == "YieldNode"
+              # yield x -> set outer bp from inner bp, then run outer block body
+              yargs = @nd_arguments[inner_nid]
+              if yargs >= 0
+                yaids = get_args(yargs)
+                yk = 0
+                while yk < yaids.length
+                  if yk < outer_bp_names.length
+                    emit("  lv_" + outer_bp_names[yk] + " = " + compile_expr_remap(yaids[yk], map_from, map_to) + ";")
+                  end
+                  yk = yk + 1
+                end
+              end
+              obody = @nd_body[outer_blk]
+              if obody >= 0
+                ostmts = get_stmts(obody)
+                ok = 0
+                while ok < ostmts.length
+                  compile_stmt(ostmts[ok])
+                  ok = ok + 1
+                end
+              end
+            else
+              compile_stmt_with_block(inner_nid, outer_blk, outer_bp_names, map_from, map_to)
+            end
+            sk = sk + 1
+          end
+        end
+      end
+      @indent = @indent - 1
+      emit("  }")
+    end
+    @in_loop = old
+  end
+
+  def scan_captured_locals(nid, excludes, names, types)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "LocalVariableReadNode"
+      lname = @nd_name[nid]
+      if not_in(lname, excludes) == 1
+        if not_in(lname, names) == 1
+          names.push(lname)
+          vt = find_var_type(lname)
+          if vt == ""
+            vt = "int"
+          end
+          types.push(vt)
+        end
+      end
+    end
+    if @nd_type[nid] == "LocalVariableWriteNode"
+      lname = @nd_name[nid]
+      if not_in(lname, excludes) == 1
+        if not_in(lname, names) == 1
+          names.push(lname)
+          vt = find_var_type(lname)
+          if vt == ""
+            vt = "int"
+          end
+          types.push(vt)
+        end
+      end
+    end
+    # Recurse
+    if @nd_body[nid] >= 0
+      scan_captured_locals(@nd_body[nid], excludes, names, types)
+    end
+    stmts = parse_id_list(@nd_stmts[nid])
+    k = 0
+    while k < stmts.length
+      scan_captured_locals(stmts[k], excludes, names, types)
+      k = k + 1
+    end
+    if @nd_expression[nid] >= 0
+      scan_captured_locals(@nd_expression[nid], excludes, names, types)
+    end
+    if @nd_predicate[nid] >= 0
+      scan_captured_locals(@nd_predicate[nid], excludes, names, types)
+    end
+    if @nd_left[nid] >= 0
+      scan_captured_locals(@nd_left[nid], excludes, names, types)
+    end
+    if @nd_right[nid] >= 0
+      scan_captured_locals(@nd_right[nid], excludes, names, types)
+    end
+    if @nd_subsequent[nid] >= 0
+      scan_captured_locals(@nd_subsequent[nid], excludes, names, types)
+    end
+    if @nd_else_clause[nid] >= 0
+      scan_captured_locals(@nd_else_clause[nid], excludes, names, types)
+    end
+    if @nd_arguments[nid] >= 0
+      scan_captured_locals(@nd_arguments[nid], excludes, names, types)
+    end
+    args = parse_id_list(@nd_args[nid])
+    k = 0
+    while k < args.length
+      scan_captured_locals(args[k], excludes, names, types)
+      k = k + 1
+    end
+    if @nd_receiver[nid] >= 0
+      scan_captured_locals(@nd_receiver[nid], excludes, names, types)
+    end
+  end
+
+  def compile_map_block(nid)
+    @needs_int_array = 1
+    @needs_gc = 1
+    old = @in_loop
+    @in_loop = 1
+    rt = infer_type(@nd_receiver[nid])
+    rc = compile_expr(@nd_receiver[nid])
+    bp1 = get_block_param(nid, 0)
+    if bp1 == ""
+      bp1 = "_x"
+    end
+    tmp_arr = new_temp
+    tmp_i = new_temp
+    if rt == "int_array"
+      emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
+      emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
+      emit("    lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
+      @indent = @indent + 1
+      blk = @nd_block[nid]
+      if blk >= 0
+        body = @nd_body[blk]
+        if body >= 0
+          stmts = get_stmts(body)
+          if stmts.length > 0
+            last = stmts[stmts.length - 1]
+            val = compile_expr(last)
+            emit("  sp_IntArray_push(" + tmp_arr + ", " + val + ");")
+          end
+        end
+      end
+      @indent = @indent - 1
+      emit("  }")
+    end
+    if rt == "str_array"
+      @needs_str_array = 1
+      emit("  sp_StrArray *" + tmp_arr + " = sp_StrArray_new();")
+      emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_StrArray_length(" + rc + "); " + tmp_i + "++) {")
+      emit("    lv_" + bp1 + " = sp_StrArray_get(" + rc + ", " + tmp_i + ");")
+      @indent = @indent + 1
+      blk = @nd_block[nid]
+      if blk >= 0
+        body = @nd_body[blk]
+        if body >= 0
+          stmts = get_stmts(body)
+          if stmts.length > 0
+            last = stmts[stmts.length - 1]
+            val = compile_expr(last)
+            emit("  sp_StrArray_push(" + tmp_arr + ", " + val + ");")
+          end
+        end
+      end
+      @indent = @indent - 1
+      emit("  }")
+    end
+    @in_loop = old
+  end
+
+  def compile_select_block(nid)
+    @needs_int_array = 1
+    @needs_gc = 1
+    old = @in_loop
+    @in_loop = 1
+    rt = infer_type(@nd_receiver[nid])
+    rc = compile_expr(@nd_receiver[nid])
+    bp1 = get_block_param(nid, 0)
+    if bp1 == ""
+      bp1 = "_x"
+    end
+    tmp_arr = new_temp
+    tmp_i = new_temp
+    if rt == "int_array"
+      emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
+      emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
+      emit("    lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
+      @indent = @indent + 1
+      blk = @nd_block[nid]
+      if blk >= 0
+        body = @nd_body[blk]
+        if body >= 0
+          stmts = get_stmts(body)
+          if stmts.length > 0
+            last = stmts[stmts.length - 1]
+            cond = compile_expr(last)
+            emit("  if (" + cond + ") sp_IntArray_push(" + tmp_arr + ", lv_" + bp1 + ");")
+          end
+        end
+      end
+      @indent = @indent - 1
+      emit("  }")
+    end
+    @in_loop = old
+  end
+
   def compile_stmts_body(nid)
     if nid < 0
       return
@@ -5416,6 +6510,38 @@ class Compiler
         emit("  return " + c_default_val(return_type) + ";")
       end
       return
+    end
+    if @nd_type[last] == "YieldNode"
+      compile_yield_stmt(last)
+      if return_type != "void"
+        emit("  return " + c_default_val(return_type) + ";")
+      end
+      return
+    end
+    # If last statement is a CallNode with a block, handle map/select as expressions
+    if @nd_type[last] == "CallNode"
+      if @nd_block[last] >= 0
+        lmname = @nd_name[last]
+        if lmname == "map"
+          if return_type != "void"
+            val = compile_map_expr(last)
+            emit("  return " + val + ";")
+            return
+          end
+        end
+        if lmname == "select"
+          if return_type != "void"
+            val = compile_select_expr(last)
+            emit("  return " + val + ";")
+            return
+          end
+        end
+        compile_stmt(last)
+        if return_type != "void"
+          emit("  return " + c_default_val(return_type) + ";")
+        end
+        return
+      end
     end
     if return_type != "void"
       emit("  return " + compile_expr(last) + ";")
