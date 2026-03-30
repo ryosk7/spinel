@@ -258,10 +258,10 @@ class Compiler
       if line.length > 0
         parts = line.split(" ")
         if parts.length >= 2
-          if parts[0] == "ROOT"
+          if parts.first == "ROOT"
             @root_id = parts[1].to_i
           end
-          if parts[0] == "N"
+          if parts.first == "N"
             nid = parts[1].to_i
             if nid > max_id
               max_id = nid
@@ -293,7 +293,7 @@ class Compiler
     if parts.length < 3
       return
     end
-    tag = parts[0]
+    tag = parts.first
     nid = parts[1].to_i
     if tag == "N"
       @nd_type[nid] = parts[2]
@@ -877,7 +877,7 @@ class Compiler
       # Infer from first in branch
       conds = parse_id_list(@nd_conditions[nid])
       if conds.length > 0
-        inid = conds[0]
+        inid = conds.first
         if @nd_type[inid] == "InNode"
           ibody = @nd_body[inid]
           if ibody >= 0
@@ -894,7 +894,7 @@ class Compiler
       # Infer from first when branch
       conds = parse_id_list(@nd_conditions[nid])
       if conds.length > 0
-        wid = conds[0]
+        wid = conds.first
         if @nd_type[wid] == "WhenNode"
           wbody = @nd_body[wid]
           if wbody >= 0
@@ -1038,7 +1038,7 @@ class Compiler
         if args_id >= 0
           aargs = get_args(args_id)
           if aargs.length > 0
-            rt2 = infer_type(aargs[0])
+            rt2 = infer_type(aargs.first)
             if rt2 == "float"
               return "float"
             end
@@ -1058,7 +1058,7 @@ class Compiler
         if args_id >= 0
           aargs = get_args(args_id)
           if aargs.length > 0
-            rt2 = infer_type(aargs[0])
+            rt2 = infer_type(aargs.first)
             if rt2 == "float"
               return "float"
             end
@@ -1084,7 +1084,7 @@ class Compiler
         if args_id >= 0
           aargs = get_args(args_id)
           if aargs.length > 0
-            rt2 = infer_type(aargs[0])
+            rt2 = infer_type(aargs.first)
             if rt2 == "float"
               return "float"
             end
@@ -1104,7 +1104,7 @@ class Compiler
         if args_id >= 0
           aargs = get_args(args_id)
           if aargs.length > 0
-            rt2 = infer_type(aargs[0])
+            rt2 = infer_type(aargs.first)
             if rt2 == "float"
               return "float"
             end
@@ -4647,7 +4647,7 @@ class Compiler
     if @nd_type[nid] == "CaseMatchNode"
       conds = parse_id_list(@nd_conditions[nid])
       if conds.length > 0
-        inid = conds[0]
+        inid = conds.first
         if @nd_type[inid] == "InNode"
           ibody = @nd_body[inid]
           if ibody >= 0
@@ -7788,7 +7788,7 @@ class Compiler
       if body >= 0
         stmts = get_stmts(body)
         if stmts.length > 0
-          return compile_expr(stmts[0])
+          return compile_expr(stmts.first)
         end
       end
       return "0"
@@ -7848,7 +7848,7 @@ class Compiler
             wconds = parse_id_list(@nd_conditions[wid])
             cexpr = "0"
             if wconds.length > 0
-              cexpr = compile_expr(wconds[0])
+              cexpr = compile_expr(wconds.first)
             end
             emit("  " + kw + " (" + cexpr + ") {")
             wbody = @nd_body[wid]
@@ -7973,7 +7973,7 @@ class Compiler
           if body >= 0
             stmts = get_stmts(body)
             if stmts.length > 0
-              inner = stmts[0]
+              inner = stmts.first
               it = infer_type(inner)
               if it == "int"
                 fmt = fmt + "%lld"
@@ -8317,7 +8317,7 @@ class Compiler
           if args_id >= 0
             aargs = get_args(args_id)
             if aargs.length > 0
-              ac = wrap_as_sp_val(aargs[0])
+              ac = wrap_as_sp_val(aargs.first)
               return "sp_lam_call(" + rc + ", " + ac + ")"
             end
           end
@@ -8328,7 +8328,7 @@ class Compiler
           if args_id >= 0
             aargs = get_args(args_id)
             if aargs.length > 0
-              ac = wrap_as_sp_val(aargs[0])
+              ac = wrap_as_sp_val(aargs.first)
               return "sp_lam_call(" + rc + ", " + ac + ")"
             end
           end
@@ -8470,7 +8470,7 @@ class Compiler
       if args_id >= 0
         aargs = get_args(args_id)
         if aargs.length > 0
-          rt = infer_type(aargs[0])
+          rt = infer_type(aargs.first)
           if rt == "float"
             return "((mrb_float)" + compile_expr(recv) + " / " + compile_arg0(nid) + ")"
           end
@@ -8564,13 +8564,13 @@ class Compiler
                 @needs_float_array = 1
                 tmp = new_temp
                 emit("  sp_FloatArray *" + tmp + " = sp_FloatArray_new();")
-                emit("  { mrb_int _n = " + compile_expr(aargs[0]) + "; mrb_float _v = " + compile_expr(aargs[1]) + "; for (mrb_int _i = 0; _i < _n; _i++) sp_FloatArray_push(" + tmp + ", _v); }")
+                emit("  { mrb_int _n = " + compile_expr(aargs.first) + "; mrb_float _v = " + compile_expr(aargs[1]) + "; for (mrb_int _i = 0; _i < _n; _i++) sp_FloatArray_push(" + tmp + ", _v); }")
                 return tmp
               end
               @needs_int_array = 1
               tmp = new_temp
               emit("  sp_IntArray *" + tmp + " = sp_IntArray_new();")
-              emit("  { mrb_int _n = " + compile_expr(aargs[0]) + "; mrb_int _v = " + compile_expr(aargs[1]) + "; for (mrb_int _i = 0; _i < _n; _i++) sp_IntArray_push(" + tmp + ", _v); }")
+              emit("  { mrb_int _n = " + compile_expr(aargs.first) + "; mrb_int _v = " + compile_expr(aargs[1]) + "; for (mrb_int _i = 0; _i < _n; _i++) sp_IntArray_push(" + tmp + ", _v); }")
               return tmp
             end
           end
@@ -8585,8 +8585,8 @@ class Compiler
             aargs = get_args(args_id)
             if aargs.length >= 1
               # Hash.new(default_val) - check type
-              defval = compile_expr(aargs[0])
-              dt = infer_type(aargs[0])
+              defval = compile_expr(aargs.first)
+              dt = infer_type(aargs.first)
               if dt == "string"
                 @needs_str_str_hash = 1
                 return "sp_StrStrHash_new()"
@@ -8604,7 +8604,7 @@ class Compiler
           if args_id >= 0
             aargs = get_args(args_id)
             if aargs.length >= 1
-              return "sp_StringIO_new_s(" + compile_expr(aargs[0]) + ")"
+              return "sp_StringIO_new_s(" + compile_expr(aargs.first) + ")"
             end
           end
           return "sp_StringIO_new()"
@@ -8638,7 +8638,7 @@ class Compiler
         if args_id >= 0
           aargs = get_args(args_id)
           if aargs.length >= 1
-            return "sp_StringIO_read_n(" + rc + ", " + compile_expr(aargs[0]) + ")"
+            return "sp_StringIO_read_n(" + rc + ", " + compile_expr(aargs.first) + ")"
           end
         end
         return "sp_StringIO_read(" + rc + ")"
@@ -8657,7 +8657,7 @@ class Compiler
         if args_id >= 0
           aargs = get_args(args_id)
           if aargs.length >= 1
-            emit("  sp_StringIO_puts(" + rc + ", " + compile_expr(aargs[0]) + ");")
+            emit("  sp_StringIO_puts(" + rc + ", " + compile_expr(aargs.first) + ");")
             return "0"
           end
         end
@@ -9518,8 +9518,8 @@ class Compiler
         if pb >= 0
           pstmts = get_stmts(pb)
           if pstmts.length > 0
-            if @nd_type[pstmts[0]] == "RangeNode"
-              range_nid = pstmts[0]
+            if @nd_type[pstmts.first] == "RangeNode"
+              range_nid = pstmts.first
             end
           end
         end
@@ -10687,7 +10687,7 @@ class Compiler
         wconds = parse_id_list(@nd_conditions[wid])
         cexpr = "0"
         if wconds.length > 0
-          cexpr = compile_expr(wconds[0])
+          cexpr = compile_expr(wconds.first)
         end
         emit("  " + kw + " (" + cexpr + ") {")
         @indent = @indent + 1
@@ -11651,7 +11651,7 @@ class Compiler
           if args_id >= 0
             aargs = get_args(args_id)
             if aargs.length > 0
-              ac = compile_lambda_body_expr(aargs[0], params, captures)
+              ac = compile_lambda_body_expr(aargs.first, params, captures)
               return "sp_lam_call(" + rc + ", " + ac + ")"
             end
           end
@@ -11666,7 +11666,7 @@ class Compiler
           if args_id >= 0
             aargs = get_args(args_id)
             if aargs.length > 0
-              ac = compile_lambda_body_expr(aargs[0], params, captures)
+              ac = compile_lambda_body_expr(aargs.first, params, captures)
               return "sp_lam_call(" + rc + ", " + ac + ")"
             end
           end
@@ -13734,7 +13734,7 @@ class Compiler
         wconds = parse_id_list(@nd_conditions[wid])
         cexpr = "0"
         if wconds.length > 0
-          cexpr = compile_expr(wconds[0])
+          cexpr = compile_expr(wconds.first)
         end
         emit("  " + kw + " (" + cexpr + ") {")
         @indent = @indent + 1
