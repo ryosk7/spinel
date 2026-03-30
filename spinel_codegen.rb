@@ -772,6 +772,9 @@ class Compiler
       return "int"
     end
     if t == "ConstantReadNode"
+      if @nd_name[nid] == "ARGV"
+        return "argv"
+      end
       ci = find_const_idx(@nd_name[nid])
       if ci >= 0
         return @const_types[ci]
@@ -1040,6 +1043,21 @@ class Compiler
       return "int"
     end
     if mname == "__method__"
+      return "string"
+    end
+    if mname == "join"
+      return "string"
+    end
+    if mname == "uniq"
+      if recv >= 0
+        return infer_type(recv)
+      end
+      return "int_array"
+    end
+    if mname == "format"
+      return "string"
+    end
+    if mname == "sprintf"
       return "string"
     end
     if mname == "positive?"
@@ -4010,6 +4028,8 @@ class Compiler
     emit_raw("static mrb_int sp_IntArray_max(sp_IntArray*a){mrb_int m=a->data[a->start];for(mrb_int i=1;i<a->len;i++)if(a->data[a->start+i]>m)m=a->data[a->start+i];return m;}")
     emit_raw("static mrb_int sp_IntArray_sum(sp_IntArray*a){mrb_int s=0;for(mrb_int i=0;i<a->len;i++)s+=a->data[a->start+i];return s;}")
     emit_raw("static mrb_bool sp_IntArray_include(sp_IntArray*a,mrb_int v){for(mrb_int i=0;i<a->len;i++)if(a->data[a->start+i]==v)return TRUE;return FALSE;}")
+    emit_raw("static sp_IntArray*sp_IntArray_uniq(sp_IntArray*a){sp_IntArray*b=sp_IntArray_new();for(mrb_int i=0;i<a->len;i++){int found=0;for(mrb_int j=0;j<b->len;j++){if(b->data[b->start+j]==a->data[a->start+i]){found=1;break;}}if(!found)sp_IntArray_push(b,a->data[a->start+i]);}return b;}")
+    emit_raw("static const char*sp_IntArray_join(sp_IntArray*a,const char*sep){size_t sl=strlen(sep),cap=256;char*buf=(char*)malloc(cap);size_t len=0;for(mrb_int i=0;i<a->len;i++){if(i>0){if(len+sl>=cap){cap*=2;buf=(char*)realloc(buf,cap);}memcpy(buf+len,sep,sl);len+=sl;}char tmp[32];int n=snprintf(tmp,32,\"%lld\",(long long)a->data[a->start+i]);if(len+n>=cap){cap*=2;buf=(char*)realloc(buf,cap);}memcpy(buf+len,tmp,n);len+=n;}buf[len]=0;return buf;}")
     emit_raw("")
   end
 
@@ -5244,13 +5264,53 @@ class Compiler
       i = i + 1
     end
 
+    # Declare vars for second pass to resolve dependent types
+    j = 0
+    while j < lnames.length
+      declare_var(lnames[j], ltypes[j])
+      j = j + 1
+    end
+    # Second pass with vars in scope
+    lnames2 = []
+    ltypes2 = []
+    i = 0
+    while i < stmts.length
+      sid = stmts[i]
+      if @nd_type[sid] != "DefNode"
+        if @nd_type[sid] != "ClassNode"
+          if @nd_type[sid] != "ConstantWriteNode"
+            if @nd_type[sid] != "ModuleNode"
+              scan_locals(sid, lnames2, ltypes2, empty_params)
+            end
+          end
+        end
+      end
+      i = i + 1
+    end
+    # Update types that improved in second pass
+    j = 0
+    while j < lnames2.length
+      k = 0
+      while k < lnames.length
+        if lnames[k] == lnames2[j]
+          if ltypes[k] == "int"
+            if ltypes2[j] != "int"
+              ltypes[k] = ltypes2[j]
+              set_var_type(lnames[k], ltypes2[j])
+            end
+          end
+        end
+        k = k + 1
+      end
+      j = j + 1
+    end
+
     vol = ""
     if @needs_setjmp == 1
       vol = "volatile "
     end
     j = 0
     while j < lnames.length
-      declare_var(lnames[j], ltypes[j])
       ctp = c_type(ltypes[j])
       if type_is_pointer(ltypes[j]) == 1
         emit("  " + vol + ctp + "lv_" + lnames[j] + " = NULL;")
@@ -5333,6 +5393,9 @@ class Compiler
       return "self->" + sanitize_ivar(@nd_name[nid])
     end
     if t == "ConstantReadNode"
+      if @nd_name[nid] == "ARGV"
+        return "sp_argv"
+      end
       ci = find_const_idx(@nd_name[nid])
       if ci >= 0
         return "cst_" + @nd_name[nid]
@@ -5402,6 +5465,21 @@ class Compiler
     end
     if t == "DefinedNode"
       return "\"expression\""
+    end
+    if t == "RescueModifierNode"
+      @needs_setjmp = 1
+      tmp = new_temp
+      rt = infer_type(@nd_else_clause[nid])
+      emit("  " + c_type(rt) + " " + tmp + " = " + c_default_val(rt) + ";")
+      emit("  sp_exc_top++;")
+      emit("  if (setjmp(sp_exc_stack[sp_exc_top-1]) == 0) {")
+      emit("    " + tmp + " = " + compile_expr(@nd_expression[nid]) + ";")
+      emit("    sp_exc_top--;")
+      emit("  } else {")
+      emit("    sp_exc_top--;")
+      emit("    " + tmp + " = " + compile_expr(@nd_else_clause[nid]) + ";")
+      emit("  }")
+      return tmp
     end
     if t == "XStringNode"
       @needs_file_io = 1
@@ -5645,6 +5723,58 @@ class Compiler
       end
       if mname == "__method__"
         return "\"" + @current_method_name + "\""
+      end
+      if mname == "p"
+        # p(val) -> puts(val.inspect) - for simplicity, same as puts
+        compile_puts(nid)
+        return "0"
+      end
+      if mname == "srand"
+        emit("  srand((unsigned)" + compile_arg0(nid) + ");")
+        return "0"
+      end
+      if mname == "rand"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          return "((mrb_int)(rand() % (int)" + compile_arg0(nid) + "))"
+        end
+        return "((mrb_int)rand())"
+      end
+      if mname == "raise"
+        @needs_setjmp = 1
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          arg_ids = get_args(args_id)
+          if arg_ids.length >= 1
+            emit("  sp_raise(" + compile_expr(arg_ids[0]) + ");")
+          end
+        else
+          emit("  sp_raise(\"RuntimeError\");")
+        end
+        return "0"
+      end
+      if mname == "format"
+        @needs_string_helpers = 1
+        return compile_sprintf_call(nid)
+      end
+      if mname == "sprintf"
+        @needs_string_helpers = 1
+        return compile_sprintf_call(nid)
+      end
+      if mname == "putc"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          arg_ids = get_args(args_id)
+          if arg_ids.length > 0
+            at = infer_type(arg_ids[0])
+            if at == "int"
+              return "(putchar((char)" + compile_expr(arg_ids[0]) + "), 0)"
+            else
+              return "(putchar(" + compile_expr(arg_ids[0]) + "[0]), 0)"
+            end
+          end
+        end
+        return "0"
       end
       mi = find_method_idx(mname)
       if mi >= 0
@@ -6116,6 +6246,16 @@ class Compiler
       if mname == "to_a"
         return "sp_IntArray_dup(" + rc + ")"
       end
+      if mname == "uniq"
+        return "sp_IntArray_uniq(" + rc + ")"
+      end
+      if mname == "join"
+        @needs_string_helpers = 1
+        return "sp_IntArray_join(" + rc + ", " + compile_arg0(nid) + ")"
+      end
+      if mname == "reverse"
+        return "({ sp_IntArray *_r = sp_IntArray_dup(" + rc + "); sp_IntArray_reverse_bang(_r); _r; })"
+      end
     end
     if recv_type == "str_array"
       if mname == "length"
@@ -6192,6 +6332,18 @@ class Compiler
     if mname == "inject"
       if @nd_block[nid] >= 0
         return compile_reduce_expr(nid)
+      end
+    end
+
+    # ARGV methods
+    if @nd_type[recv] == "ConstantReadNode"
+      if @nd_name[recv] == "ARGV"
+        if mname == "length"
+          return "sp_argv.len"
+        end
+        if mname == "[]"
+          return "sp_argv.data[(int)" + compile_arg0(nid) + "]"
+        end
       end
     end
 
@@ -8089,6 +8241,32 @@ class Compiler
       @indent = @indent - 1
       emit("  }")
     end
+  end
+
+  def compile_sprintf_call(nid)
+    @needs_string_helpers = 1
+    args_id = @nd_arguments[nid]
+    if args_id < 0
+      return "\"\""
+    end
+    arg_ids = get_args(args_id)
+    if arg_ids.length == 0
+      return "\"\""
+    end
+    # First arg is format string, rest are values
+    fmt = compile_expr(arg_ids[0])
+    result = "sp_sprintf(" + fmt
+    k = 1
+    while k < arg_ids.length
+      at = infer_type(arg_ids[k])
+      if at == "float"
+        result = result + ", " + compile_expr(arg_ids[k])
+      else
+        result = result + ", " + compile_expr(arg_ids[k])
+      end
+      k = k + 1
+    end
+    result + ")"
   end
 
   def compile_catch_expr(nid)
