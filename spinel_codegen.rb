@@ -147,6 +147,7 @@ class Compiler
     # Module tracking: module_name -> body node id
     @module_names = "".split(",")
     @module_body_ids = []
+    @pending_method_ref = ""
   end
 
   def join_sep(arr, sep)
@@ -495,6 +496,8 @@ class Compiler
   end
 
   def set_array_field(nid, field, ids_str)
+    $stderr.print " "
+    $stderr.print " "
     if field == "body"
       @nd_stmts[nid] = ids_str
     end
@@ -8653,7 +8656,7 @@ class Compiler
       if pred_type == "poly"
         return "(" + tmp + ".tag == SP_TAG_INT && " + tmp + ".v.i == " + @nd_value[pat_id].to_s + ")"
       end
-      return tmp + " == " + @nd_value[pat_id].to_s
+      return "#{tmp} == #{@nd_value[pat_id]}"
     end
     if pt == "StringNode"
       if pred_type == "poly"
