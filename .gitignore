@@ -18,3 +18,4 @@
 /spinel_parse_bin
 /perf.data
 /perf.data.old
+/lib/regexp/libspre.a

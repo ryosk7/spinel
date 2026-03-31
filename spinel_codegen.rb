@@ -131,6 +131,9 @@ class Compiler
     @needs_file_io = 0
     @needs_mutable_str = 0
     @needs_rb_value = 0
+    @needs_regexp = 0
+    @regexp_patterns = "".split(",")
+    @regexp_flags = "".split(",")
     @needs_stringio = 0
     @needs_proc = 0
     @proc_counter = 0
@@ -634,6 +637,20 @@ class Compiler
   end
 
   # ---- Class/Method lookup (all parallel arrays) ----
+  def find_regexp_index(nid)
+    if @nd_type[nid] == "RegularExpressionNode"
+      pat = @nd_unescaped[nid]
+      i = 0
+      while i < @regexp_patterns.length
+        if @regexp_patterns[i] == pat
+          return i
+        end
+        i = i + 1
+      end
+    end
+    -1
+  end
+
   def find_class_idx(name)
     i = 0
     while i < @cls_names.length
@@ -766,6 +783,12 @@ class Compiler
     end
     if t == "SymbolNode"
       return "string"
+    end
+    if t == "NumberedReferenceReadNode"
+      return "string"
+    end
+    if t == "MatchWriteNode"
+      return "int"
     end
     if t == "InterpolatedStringNode"
       return "string"
@@ -1195,6 +1218,9 @@ class Compiler
       end
       return "int"
     end
+    if mname == "=~"
+      return "int"
+    end
     if mname == "<<"
       if recv >= 0
         lt = infer_type(recv)
@@ -1270,6 +1296,9 @@ class Compiler
       return "string"
     end
     if mname == "include?"
+      return "bool"
+    end
+    if mname == "match?"
       return "bool"
     end
     if mname == "start_with?"
@@ -4979,6 +5008,30 @@ class Compiler
       @needs_file_io = 1
       @needs_string_helpers = 1
     end
+    if t == "RegularExpressionNode"
+      @needs_regexp = 1
+      # Collect pattern and flags
+      pat = @nd_unescaped[nid]
+      flags = "0"
+      if @nd_flags[nid] != 0
+        f = @nd_flags[nid]
+        parts = "".split(",")
+        if f & 1 != 0
+          parts.push("1")
+        end
+        if f & 2 != 0
+          parts.push("6")
+        end
+        if f & 8 != 0
+          parts.push("8")
+        end
+        if parts.length > 0
+          flags = parts.join("|")
+        end
+      end
+      @regexp_patterns.push(pat)
+      @regexp_flags.push(flags)
+    end
     if t == "XStringNode"
       @needs_file_io = 1
     end
@@ -5874,6 +5927,13 @@ class Compiler
       end
       emit_mutable_str_runtime
     end
+    if @needs_regexp == 1
+      if @needs_string_helpers == 0
+        @needs_string_helpers = 1
+        emit_string_helpers
+      end
+      emit_regexp_runtime
+    end
     if @needs_rb_value == 1
       if @needs_string_helpers == 0
         @needs_string_helpers = 1
@@ -6111,6 +6171,144 @@ class Compiler
     emit_raw("static inline const char*sp_String_cstr(sp_String*s){return s->data;}")
     emit_raw("static inline int64_t sp_String_length(sp_String*s){return s->len;}")
     emit_raw("static sp_String*sp_String_dup(sp_String*s){return sp_String_new(s->data);}")
+    emit_raw("")
+  end
+
+  def emit_regexp_runtime
+    # Declarations for the external regexp library (libspre.a)
+    emit_raw("/* Regexp engine (link with libspre.a from lib/regexp/) */")
+    emit_raw("typedef struct mrb_regexp_pattern mrb_regexp_pattern;")
+    emit_raw("mrb_regexp_pattern* re_compile(const char *pattern, int64_t len, uint32_t flags);")
+    emit_raw("void re_free(mrb_regexp_pattern *pat);")
+    emit_raw("int re_exec(const mrb_regexp_pattern *pat, const char *str, int64_t len, int64_t start, int *captures, int captures_size);")
+    emit_raw("")
+    emit_raw("/* Regexp globals: $1-$9 captures */")
+    emit_raw("static const char *sp_re_captures[10] = {0};")
+    emit_raw("static int sp_re_caps[64];")
+    emit_raw("static const char *sp_re_last_str = \"\";")
+    emit_raw("")
+    emit_raw("static void sp_re_set_captures(const char *str, int *caps, int ncaps) {")
+    emit_raw("  sp_re_last_str = str;")
+    emit_raw("  for (int i = 0; i < 10; i++) sp_re_captures[i] = NULL;")
+    emit_raw("  for (int i = 1; i < ncaps && i < 10; i++) {")
+    emit_raw("    if (caps[i*2] >= 0 && caps[i*2+1] >= 0) {")
+    emit_raw("      int len = caps[i*2+1] - caps[i*2];")
+    emit_raw("      char *buf = (char*)malloc(len+1);")
+    emit_raw("      memcpy(buf, str+caps[i*2], len); buf[len] = 0;")
+    emit_raw("      sp_re_captures[i] = buf;")
+    emit_raw("    }")
+    emit_raw("  }")
+    emit_raw("}")
+    emit_raw("")
+    emit_raw("static mrb_int sp_re_match(mrb_regexp_pattern *pat, const char *str) {")
+    emit_raw("  int64_t slen = (int64_t)strlen(str);")
+    emit_raw("  int ncaps = 32;")
+    emit_raw("  int n = re_exec(pat, str, slen, 0, sp_re_caps, ncaps);")
+    emit_raw("  if (n > 0) { sp_re_set_captures(str, sp_re_caps, n/2); return sp_re_caps[0] + 1; }")
+    emit_raw("  return 0;")
+    emit_raw("}")
+    emit_raw("")
+    emit_raw("static mrb_bool sp_re_match_p(mrb_regexp_pattern *pat, const char *str) {")
+    emit_raw("  int64_t slen = (int64_t)strlen(str);")
+    emit_raw("  int caps[2];")
+    emit_raw("  return re_exec(pat, str, slen, 0, caps, 2) > 0;")
+    emit_raw("}")
+    emit_raw("")
+    emit_raw("static const char *sp_re_gsub(mrb_regexp_pattern *pat, const char *str, const char *rep) {")
+    emit_raw("  int64_t slen = (int64_t)strlen(str); size_t rlen = strlen(rep);")
+    emit_raw("  size_t cap = slen * 2 + 64; char *out = (char*)malloc(cap); size_t olen = 0;")
+    emit_raw("  int64_t pos = 0; int caps[64];")
+    emit_raw("  while (pos <= slen) {")
+    emit_raw("    int n = re_exec(pat, str, slen, pos, caps, 64);")
+    emit_raw("    if (n <= 0 || caps[0] < 0) break;")
+    emit_raw("    size_t before = caps[0] - pos;")
+    emit_raw("    if (olen+before+rlen >= cap) { cap = (olen+before+rlen)*2+64; out = (char*)realloc(out, cap); }")
+    emit_raw("    memcpy(out+olen, str+pos, before); olen += before;")
+    emit_raw("    memcpy(out+olen, rep, rlen); olen += rlen;")
+    emit_raw("    pos = caps[1]; if (caps[0] == caps[1]) pos++;")
+    emit_raw("  }")
+    emit_raw("  size_t rest = slen - pos;")
+    emit_raw("  if (olen+rest >= cap) { cap = olen+rest+1; out = (char*)realloc(out, cap); }")
+    emit_raw("  memcpy(out+olen, str+pos, rest); olen += rest;")
+    emit_raw("  out[olen] = 0; return out;")
+    emit_raw("}")
+    emit_raw("")
+    emit_raw("static const char *sp_re_sub(mrb_regexp_pattern *pat, const char *str, const char *rep) {")
+    emit_raw("  int64_t slen = (int64_t)strlen(str); size_t rlen = strlen(rep);")
+    emit_raw("  int caps[64];")
+    emit_raw("  int n = re_exec(pat, str, slen, 0, caps, 64);")
+    emit_raw("  if (n <= 0 || caps[0] < 0) return str;")
+    emit_raw("  size_t out_len = caps[0] + rlen + (slen - caps[1]);")
+    emit_raw("  char *out = (char*)malloc(out_len + 1);")
+    emit_raw("  memcpy(out, str, caps[0]);")
+    emit_raw("  memcpy(out+caps[0], rep, rlen);")
+    emit_raw("  memcpy(out+caps[0]+rlen, str+caps[1], slen-caps[1]+1);")
+    emit_raw("  return out;")
+    emit_raw("}")
+    emit_raw("")
+    emit_raw("static sp_StrArray *sp_re_scan(mrb_regexp_pattern *pat, const char *str) {")
+    emit_raw("  sp_StrArray *arr = sp_StrArray_new();")
+    emit_raw("  int64_t slen = (int64_t)strlen(str); int64_t pos = 0; int caps[64];")
+    emit_raw("  while (pos <= slen) {")
+    emit_raw("    int n = re_exec(pat, str, slen, pos, caps, 64);")
+    emit_raw("    if (n <= 0 || caps[0] < 0) break;")
+    emit_raw("    int len = caps[1] - caps[0];")
+    emit_raw("    char *m = (char*)malloc(len+1); memcpy(m, str+caps[0], len); m[len] = 0;")
+    emit_raw("    sp_StrArray_push(arr, m);")
+    emit_raw("    pos = caps[1]; if (caps[0] == caps[1]) pos++;")
+    emit_raw("  }")
+    emit_raw("  return arr;")
+    emit_raw("}")
+    emit_raw("")
+    emit_raw("static sp_StrArray *sp_re_split(mrb_regexp_pattern *pat, const char *str) {")
+    emit_raw("  sp_StrArray *arr = sp_StrArray_new();")
+    emit_raw("  int64_t slen = (int64_t)strlen(str); int64_t pos = 0; int caps[64];")
+    emit_raw("  while (pos <= slen) {")
+    emit_raw("    int n = re_exec(pat, str, slen, pos, caps, 64);")
+    emit_raw("    if (n <= 0 || caps[0] < 0) {")
+    emit_raw("      int len = slen - pos; char *m = (char*)malloc(len+1);")
+    emit_raw("      memcpy(m, str+pos, len); m[len] = 0; sp_StrArray_push(arr, m); break;")
+    emit_raw("    }")
+    emit_raw("    int len = caps[0] - pos; char *m = (char*)malloc(len+1);")
+    emit_raw("    memcpy(m, str+pos, len); m[len] = 0; sp_StrArray_push(arr, m);")
+    emit_raw("    pos = caps[1]; if (caps[0] == caps[1]) pos++;")
+    emit_raw("  }")
+    emit_raw("  return arr;")
+    emit_raw("}")
+    emit_raw("")
+    # Emit compiled pattern globals
+    i = 0
+    while i < @regexp_patterns.length
+      pat = @regexp_patterns[i]
+      flags = @regexp_flags[i]
+      emit_raw("static mrb_regexp_pattern *sp_re_pat_" + i.to_s + ";")
+      i = i + 1
+    end
+    emit_raw("")
+    emit_raw("static void sp_re_init(void) {")
+    i = 0
+    while i < @regexp_patterns.length
+      pat = @regexp_patterns[i]
+      flags = @regexp_flags[i]
+      cpat = ""
+      pi = 0
+      while pi < pat.length
+        ch = pat[pi]
+        if ch == 92.chr
+          cpat = cpat + 92.chr + 92.chr
+        else
+          if ch == 34.chr
+            cpat = cpat + 92.chr + 34.chr
+          else
+            cpat = cpat + ch
+          end
+        end
+        pi = pi + 1
+      end
+      emit_raw("  sp_re_pat_" + i.to_s + " = re_compile(\"" + cpat + "\", " + pat.length.to_s + ", " + flags + ");")
+      i = i + 1
+    end
+    emit_raw("}")
     emit_raw("")
   end
 
@@ -7442,6 +7640,11 @@ class Compiler
                     end
                   end
                   mname = @nd_name[nid]
+                  if mname == "scan"
+                    types.push("string")
+                    bk = bk + 1
+                    next
+                  end
                   if mname == "each"
                     if recv_type == "int_array"
                       if bk == 0
@@ -7600,6 +7803,9 @@ class Compiler
       emit_raw("  volatile char _sb; sp_gc_stack_bottom = (char*)&_sb;")
     end
     emit_raw("  sp_argv.data=(const char**)(argv+1);sp_argv.len=argc-1;")
+    if @needs_regexp == 1
+      emit_raw("  sp_re_init();")
+    end
 
     @in_main = 1
     @indent = 1
@@ -7754,6 +7960,17 @@ class Compiler
     end
     if t == "InterpolatedStringNode"
       return compile_interpolated(nid)
+    end
+    if t == "NumberedReferenceReadNode"
+      num = @nd_value[nid]
+      if num >= 1 && num <= 9
+        return "(sp_re_captures[" + num.to_s + "] ? sp_re_captures[" + num.to_s + "] : \"\")"
+      end
+      return "\"\""
+    end
+    if t == "MatchWriteNode"
+      # $1 = ... pattern match
+      return compile_expr(@nd_receiver[nid])
     end
     if t == "TrueNode"
       return "TRUE"
@@ -8868,6 +9085,21 @@ class Compiler
     if mname == ">="
       return "(" + compile_expr(recv) + " >= " + compile_arg0(nid) + ")"
     end
+    if mname == "=~"
+      # str =~ /pattern/ → sp_re_match(pat, str)
+      rc = compile_expr(recv)
+      arg = @nd_arguments[nid]
+      if arg >= 0
+        argl = get_args(@nd_arguments[nid])
+        if argl.length > 0
+          ridx = find_regexp_index(argl[0])
+          if ridx >= 0
+            return "sp_re_match(sp_re_pat_" + ridx.to_s + ", " + rc + ")"
+          end
+        end
+      end
+      return "(-1)"
+    end
     if mname == "=="
       return compile_eq(nid, "==")
     end
@@ -9109,18 +9341,58 @@ class Compiler
     end
     if mname == "split"
       @needs_str_array = 1
+      args_id = @nd_arguments[nid]
+      if args_id >= 0
+        a = get_args(args_id)
+        if a.length > 0
+          ridx = find_regexp_index(a[0])
+          if ridx >= 0
+            return "sp_re_split(sp_re_pat_" + ridx.to_s + ", " + rc + ")"
+          end
+        end
+      end
       return "sp_str_split(" + rc + ", " + compile_arg0(nid) + ")"
+    end
+    if mname == "match?"
+      arg = @nd_arguments[nid]
+      if arg >= 0
+        argl = get_args(arg)
+        if argl.length > 0
+          ridx = find_regexp_index(argl[0])
+          if ridx >= 0
+            return "sp_re_match_p(sp_re_pat_" + ridx.to_s + ", " + rc + ")"
+          end
+        end
+      end
+      return "sp_str_include(" + rc + ", " + compile_arg0(nid) + ")"
     end
     if mname == "gsub"
       args_id = @nd_arguments[nid]
-      arg1 = "\"\""
       if args_id >= 0
         a = get_args(args_id)
         if a.length >= 2
-          arg1 = compile_expr(a[1])
+          ridx = find_regexp_index(a[0])
+          if ridx >= 0
+            return "sp_re_gsub(sp_re_pat_" + ridx.to_s + ", " + rc + ", " + compile_expr(a[1]) + ")"
+          end
+          return "sp_str_gsub(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
         end
       end
-      return "sp_str_gsub(" + rc + ", " + compile_arg0(nid) + ", " + arg1 + ")"
+      return rc
+    end
+    if mname == "sub"
+      args_id = @nd_arguments[nid]
+      if args_id >= 0
+        a = get_args(args_id)
+        if a.length >= 2
+          ridx = find_regexp_index(a[0])
+          if ridx >= 0
+            return "sp_re_sub(sp_re_pat_" + ridx.to_s + ", " + rc + ", " + compile_expr(a[1]) + ")"
+          end
+          return "sp_str_sub(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
+        end
+      end
+      return rc
     end
     if mname == "index"
       return "sp_str_index(" + rc + ", " + compile_arg0(nid) + ")"
@@ -11603,6 +11875,42 @@ class Compiler
         else
           compile_each_block(nid)
           return 1
+        end
+      end
+    end
+
+    # scan with block: str.scan(/re/) { |m| ... }
+    if mname == "scan"
+      if @nd_block[nid] >= 0
+        recv = @nd_receiver[nid]
+        if recv >= 0
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            argl = get_args(args_id)
+            if argl.length > 0
+              ridx = find_regexp_index(argl[0])
+              if ridx >= 0
+                @needs_str_array = 1
+                rc = compile_expr(recv)
+                bp = get_block_param(nid, 0)
+                if bp == ""
+                  bp = "_m"
+                end
+                tmp_arr = new_temp
+                tmp_i = new_temp
+                emit("  sp_StrArray *" + tmp_arr + " = sp_re_scan(sp_re_pat_" + ridx.to_s + ", " + rc + ");")
+                emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < " + tmp_arr + "->len; " + tmp_i + "++) {")
+                set_var_type(bp, "string")
+                emit("    lv_" + bp + " = " + tmp_arr + "->data[" + tmp_i + "];")
+                blk = @nd_block[nid]
+                if @nd_body[blk] >= 0
+                  compile_stmts_body(@nd_body[blk])
+                end
+                emit("  }")
+                return 1
+              end
+            end
+          end
         end
       end
     end

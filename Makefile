@@ -25,7 +25,7 @@ PRISM_LIB    = build/libprism.a
 
 .PHONY: all parse bootstrap test bench clean
 
-all: parse bootstrap
+all: parse regexp bootstrap
 
 # ---- Prism static library ----
 
@@ -43,6 +43,21 @@ parse: spinel_parse_bin
 
 spinel_parse_bin: spinel_parse.c $(PRISM_LIB)
 	$(CC) $(CFLAGS) -I$(PRISM_INC) $< $(PRISM_LIB) -lm -o $@
+
+# ---- Regexp library (for programs using /pattern/) ----
+
+RE_SRC = lib/regexp/re_compile.c lib/regexp/re_exec.c lib/regexp/re_utf8.c
+RE_OBJ = $(patsubst lib/regexp/%.c,build/regexp/%.o,$(RE_SRC))
+RE_LIB = lib/regexp/libspre.a
+
+regexp: $(RE_LIB)
+
+$(RE_LIB): $(RE_OBJ)
+	ar rcs $@ $^
+
+build/regexp/%.o: lib/regexp/%.c lib/regexp/re_internal.h
+	@mkdir -p build/regexp
+	$(CC) -c -O2 -Ilib/regexp $< -o $@
 
 # ---- Bootstrap ----
 

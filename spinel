@@ -117,6 +117,11 @@ fi
 
 # Step 3: Compile C -> binary
 BIN_FILE="${OUTPUT:-$BASENAME}"
+# Auto-detect regexp usage and link libspre.a
+RE_LIB="$DIR/lib/regexp/libspre.a"
+if grep -q 're_compile' "$C_FILE" 2>/dev/null && [ -f "$RE_LIB" ]; then
+  EXTRA_FLAGS="$EXTRA_FLAGS $RE_LIB -Ilib/regexp"
+fi
 $CC_CMD -O${OPT_LEVEL} -Wno-all "$C_FILE" -lm $EXTRA_FLAGS -o "$BIN_FILE"
 if [ $? -ne 0 ]; then
   echo "spinel: C compilation failed" >&2
