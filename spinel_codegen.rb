@@ -6038,13 +6038,12 @@ class Compiler
     emit_raw("#define SP_GC_SAVE() int __attribute__((cleanup(sp_gc_cleanup))) _gc_saved = sp_gc_nroots")
     emit_raw("#define SP_GC_ROOT(v) do{if(sp_gc_nroots<SP_GC_STACK_MAX)sp_gc_roots[sp_gc_nroots++]=(void**)&(v);}while(0)")
     emit_raw("#define SP_GC_RESTORE() sp_gc_nroots = _gc_saved")
-    emit_raw("static char *sp_gc_stack_bottom = NULL;")
+    # stack_bottom removed (no conservative scan)
     emit_raw("static void sp_gc_mark(void*obj){if(!obj)return;sp_gc_hdr*h=(sp_gc_hdr*)((char*)obj-sizeof(sp_gc_hdr));if(h->marked)return;h->marked=1;if(h->scan)h->scan(obj);}")
     emit_raw("static void sp_gc_cleanup(int*p){sp_gc_nroots=*p;}")
-    emit_raw("static void sp_gc_mark_stack(void){volatile char dummy;char*sp=(char*)&dummy;char*lo=sp,*hi=sp_gc_stack_bottom;if(lo>hi){char*t=lo;lo=hi;hi=t;}for(sp_gc_hdr*h=sp_gc_heap;h;h=h->next){void*obj=(char*)h+sizeof(sp_gc_hdr);void**p=(void**)lo;while((char*)p<hi){if(*p==obj){sp_gc_mark(obj);break;}p++;}}}")
-    emit_raw("static void sp_gc_collect(void){for(int i=0;i<sp_gc_nroots;i++){void*obj=*sp_gc_roots[i];if(obj)sp_gc_mark(obj);}sp_gc_mark_stack();sp_gc_hdr**pp=&sp_gc_heap;sp_gc_bytes=0;while(*pp){sp_gc_hdr*h=*pp;if(!h->marked){*pp=h->next;if(h->finalize)h->finalize((char*)h+sizeof(sp_gc_hdr));free(h);}else{h->marked=0;sp_gc_bytes+=h->size;pp=&h->next;}}}")
+    emit_raw("static void sp_gc_collect(void){for(int i=0;i<sp_gc_nroots;i++){void*obj=*sp_gc_roots[i];if(obj)sp_gc_mark(obj);}sp_gc_hdr**pp=&sp_gc_heap;sp_gc_bytes=0;while(*pp){sp_gc_hdr*h=*pp;if(!h->marked){*pp=h->next;if(h->finalize)h->finalize((char*)h+sizeof(sp_gc_hdr));free(h);}else{h->marked=0;sp_gc_bytes+=h->size;pp=&h->next;}}}")
     emit_raw("static size_t sp_gc_threshold_init=256*1024;")
-    emit_raw("static void*sp_gc_alloc(size_t sz,void(*fin)(void*),void(*scn)(void*)){if(sp_gc_bytes>sp_gc_threshold){size_t before=sp_gc_bytes;sp_gc_collect();if(sp_gc_bytes>sp_gc_threshold/2){sp_gc_threshold*=2;}else{size_t nt=sp_gc_bytes*4;if(nt<sp_gc_threshold_init)nt=sp_gc_threshold_init;if(nt>sp_gc_threshold)sp_gc_threshold=nt;}}sp_gc_hdr*h=(sp_gc_hdr*)calloc(1,sizeof(sp_gc_hdr)+sz);h->finalize=fin;h->scan=scn;h->size=sizeof(sp_gc_hdr)+sz;h->next=sp_gc_heap;sp_gc_heap=h;sp_gc_bytes+=sizeof(sp_gc_hdr)+sz;return(char*)h+sizeof(sp_gc_hdr);}")
+    emit_raw("static void*sp_gc_alloc(size_t sz,void(*fin)(void*),void(*scn)(void*)){if(sp_gc_bytes>sp_gc_threshold){size_t before=sp_gc_bytes;sp_gc_collect();size_t freed=before-sp_gc_bytes;if(freed<before/4){sp_gc_threshold=before*2;}else if(sp_gc_bytes>0){sp_gc_threshold=sp_gc_bytes*4;if(sp_gc_threshold<sp_gc_threshold_init)sp_gc_threshold=sp_gc_threshold_init;}else{sp_gc_threshold=sp_gc_threshold_init;}}sp_gc_hdr*h=(sp_gc_hdr*)calloc(1,sizeof(sp_gc_hdr)+sz);h->finalize=fin;h->scan=scn;h->size=sizeof(sp_gc_hdr)+sz;h->next=sp_gc_heap;sp_gc_heap=h;sp_gc_bytes+=sizeof(sp_gc_hdr)+sz;return(char*)h+sizeof(sp_gc_hdr);}")
     emit_raw("")
   end
 
@@ -7009,6 +7008,28 @@ class Compiler
     emit_raw("  sp_" + cname + " *self = (sp_" + cname + " *)sp_gc_alloc(sizeof(sp_" + cname + "), NULL, " + scan_fn + ");")
     emit_raw("  SP_GC_ROOT(self);")
 
+    # Root pointer-type constructor parameters
+    if init_idx >= 0
+      all_params_str = @cls_meth_params[ci].split("|")
+      all_ptypes_str = @cls_meth_ptypes[ci].split("|")
+      if init_idx < all_params_str.length
+        cp_names = all_params_str[init_idx].split(",")
+        cp_types = "".split(",")
+        if init_idx < all_ptypes_str.length
+          cp_types = all_ptypes_str[init_idx].split(",")
+        end
+        cpi = 0
+        while cpi < cp_names.length
+          if cpi < cp_types.length
+            if type_is_pointer(cp_types[cpi]) == 1
+              emit_raw("  SP_GC_ROOT(lv_" + cp_names[cpi] + ");")
+            end
+          end
+          cpi = cpi + 1
+        end
+      end
+    end
+
     init_ci = find_init_class(ci)
     actual_init_idx = -1
     if init_ci >= 0
@@ -7210,6 +7231,12 @@ class Compiler
 
     if bid >= 0
       declare_method_locals(bid, pnames)
+      if @in_gc_scope == 0
+        if @needs_gc == 1
+          emit("  SP_GC_SAVE();")
+          @in_gc_scope = 1
+        end
+      end
       if @in_gc_scope == 1
         emit("  SP_GC_ROOT(self);")
         j = 0
@@ -7377,6 +7404,12 @@ class Compiler
     bid = @meth_body_ids[mi]
     if bid >= 0
       declare_method_locals(bid, pnames)
+      if @in_gc_scope == 0
+        if @needs_gc == 1
+          emit("  SP_GC_SAVE();")
+          @in_gc_scope = 1
+        end
+      end
       if @in_gc_scope == 1
         j = 0
         while j < pnames.length
@@ -7805,9 +7838,6 @@ class Compiler
     emit_raw("static sp_Argv sp_argv;")
     emit_raw("")
     emit_raw("int main(int argc,char**argv){")
-    if @needs_gc == 1
-      emit_raw("  volatile char _sb; sp_gc_stack_bottom = (char*)&_sb;")
-    end
     emit_raw("  sp_argv.data=(const char**)(argv+1);sp_argv.len=argc-1;")
     if @needs_regexp == 1
       emit_raw("  sp_re_init();")
