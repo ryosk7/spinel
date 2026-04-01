@@ -122,6 +122,7 @@ class Compiler
 
     # Feature flags
     @needs_gc = 0
+    @needs_system = 0
     @needs_int_array = 0
     @needs_float_array = 0
     @needs_str_array = 0
@@ -198,11 +199,6 @@ class Compiler
   def new_temp
     @temp_counter = @temp_counter + 1
     "_t" + @temp_counter.to_s
-  end
-
-  def new_label
-    @label_counter = @label_counter + 1
-    "_L" + @label_counter.to_s
   end
 
   # ---- AST reader ----
@@ -2371,7 +2367,6 @@ class Compiler
             # Add as top-level method with prefix
             mname = @nd_name[sid]
             # Store with special naming for lookup
-            mi = @meth_names.length
             @meth_names.push("__oc_" + cname + "_" + mname)
             params = collect_params_str(sid)
             @meth_param_names.push(params)
@@ -2389,7 +2384,6 @@ class Compiler
     parent = ""
     sp = @nd_superclass[nid]
     struct_fields = "".split(",")
-    struct_kw_init = 0
     if sp >= 0
       if @nd_type[sp] == "CallNode"
         if @nd_name[sp] == "new"
@@ -2411,7 +2405,7 @@ class Compiler
                       struct_fields.push(fname)
                     end
                     if @nd_type[sarg_ids[sk]] == "KeywordHashNode"
-                      struct_kw_init = 1
+                      # keyword_init detected
                     end
                     sk = sk + 1
                   end
@@ -3254,7 +3248,6 @@ class Compiler
           if @nd_type[@nd_receiver[sid]] == "SelfNode"
             dmname = @nd_name[sid]
             # Create as top-level method with module prefix for dispatch
-            mi = @meth_names.length
             @meth_names.push(mname + "_cls_" + dmname)
             @meth_param_names.push(collect_params_str(sid))
             @meth_param_types.push(collect_ptypes_str(sid, -1))
@@ -3837,7 +3830,6 @@ class Compiler
       all_params = @cls_meth_params[oci].split("|")
       all_ptypes = @cls_meth_ptypes[oci].split("|")
       bodies = @cls_meth_bodies[oci].split(";")
-      changed = 0
       j = 0
       while j < mnames.length
         if mnames[j] != "initialize"
@@ -3899,7 +3891,6 @@ class Compiler
                         ptypes[pk] = "obj_" + @cls_names[ci2]
                         all_ptypes[j] = ptypes.join(",")
                         @cls_meth_ptypes[oci] = all_ptypes.join("|")
-                        changed = 1
                       end
                     end
                     ci2 = ci2 + 1
@@ -5345,6 +5336,7 @@ class Compiler
       end
       if mname == "system"
         @needs_file_io = 1
+        @needs_system = 1
       end
       if @nd_receiver[nid] >= 0
         if @nd_type[@nd_receiver[nid]] == "ConstantReadNode"
@@ -6137,7 +6129,9 @@ class Compiler
     emit_raw("static const char*sp_int_chr(mrb_int n){char*s=(char*)malloc(2);s[0]=(char)n;s[1]=0;return s;}")
     emit_raw("typedef struct{mrb_int first;mrb_int last;}sp_Range;")
     emit_raw("static sp_Range sp_range_new(mrb_int f,mrb_int l){sp_Range r;r.first=f;r.last=l;return r;}")
-    emit_raw("static int sp_last_status = 0;")
+    if @needs_system == 1
+      emit_raw("static int sp_last_status = 0;")
+    end
     emit_raw("")
   end
 
@@ -6758,16 +6752,6 @@ class Compiler
               bid = bodies[mi].to_i
               if is_simple_writer_method(mn, bid) == 1
                 append_attr_writer(i, bname)
-                # Also ensure the corresponding reader exists
-                readers = @cls_attr_readers[i].split(";")
-                has_reader = 0
-                ri = 0
-                while ri < readers.length
-                  if readers[ri] == bname
-                    has_reader = 1
-                  end
-                  ri = ri + 1
-                end
               end
             end
           end
@@ -6991,8 +6975,6 @@ class Compiler
 
   def recalc_needs_gc
     # Recalculate @needs_gc: only needed if non-value-type classes are used
-    # Save and reset, then re-enable if needed
-    saved = @needs_gc
     @needs_gc = 0
     # Non-value-type class exists → GC needed
     i = 0
@@ -7664,10 +7646,6 @@ class Compiler
     end
 
     init_ci = find_init_class(ci)
-    actual_init_idx = -1
-    if init_ci >= 0
-      actual_init_idx = cls_find_method_direct(init_ci, "initialize")
-    end
 
     if init_idx >= 0
       bodies = @cls_meth_bodies[ci].split(";")
@@ -9560,7 +9538,6 @@ class Compiler
       cidx = cls_find_method(@current_class_idx, mname)
       if cidx >= 0
         ca = compile_call_args(nid)
-        cname = @cls_names[@current_class_idx]
         owner = find_method_owner(@current_class_idx, mname)
         if ca != ""
           return "sp_" + owner + "_" + sanitize_name(mname) + "(self, " + ca + ")"
@@ -9884,7 +9861,6 @@ class Compiler
           aargs = get_args(args_id)
           if aargs.length >= 1
             # Hash.new(default_val) - check type
-            defval = compile_expr(aargs.first)
             dt = infer_type(aargs.first)
             if dt == "string"
               @needs_str_str_hash = 1
@@ -10426,7 +10402,6 @@ class Compiler
       if mname == "zip"
         # zip returns array of pairs; for length-only usage, return array with same length
         tmp = new_temp
-        arg = compile_arg0(nid)
         emit("  sp_IntArray *" + tmp + " = sp_IntArray_new();")
         emit("  for (mrb_int _i = 0; _i < sp_IntArray_length(" + rc + "); _i++) sp_IntArray_push(" + tmp + ", sp_IntArray_get(" + rc + ", _i));")
         return tmp
@@ -11135,7 +11110,6 @@ class Compiler
     i = 0
     while i < @cls_names.length
       cname = @cls_names[i]
-      mi = cls_find_method(@cls_names.length - 1 - i, mname)
       # Check if this class has the method
       midx = cls_find_method_direct(i, mname)
       if midx >= 0
@@ -11245,7 +11219,6 @@ class Compiler
     kw_names = "".split(",")
     kw_vals = "".split(",")
     positional_ids = []
-    is_splat_call = 0
     ak = 0
     while ak < arg_ids.length
       if @nd_type[arg_ids[ak]] == "KeywordHashNode"
@@ -11287,7 +11260,6 @@ class Compiler
           if k < ptypes.length
             if ptypes[k] == "poly"
               # Need to box - kw_vals[ki] is already compiled
-              at_guess = "string"
               result = result + "sp_box_str(" + kw_vals[ki] + ")"
             else
               result = result + kw_vals[ki]
@@ -14071,8 +14043,6 @@ class Compiler
     # catch(:tag) do ... end
     tag = compile_arg0(nid)
     blk = @nd_block[nid]
-    bp1 = get_block_param(nid, 0)
-
     emit("  sp_catch_tag[sp_catch_top] = " + tag + ";")
     emit("  sp_catch_top++;")
     emit("  if (setjmp(sp_catch_stack[sp_catch_top-1]) == 0) {")
@@ -14624,7 +14594,6 @@ class Compiler
     saved_ci = @current_class_idx
     @current_class_idx = cci
 
-    cname = @cls_names[cci]
     @block_counter = @block_counter + 1
     suffix = "_y" + @block_counter.to_s
 
