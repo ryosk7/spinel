@@ -5703,6 +5703,130 @@ class Compiler
     pop_scope
   end
 
+  # Like infer_type but resolves default "int" from unresolved ivar accessors
+  def infer_type_deep(nid)
+    at = infer_type(nid)
+    if at == "int" && @nd_type[nid] == "CallNode"
+      recv = @nd_receiver[nid]
+      if recv >= 0
+        rt = infer_type(recv)
+        # If receiver type is default "int" from an unscoped parameter, try to resolve
+        if rt == "int" && @nd_type[recv] == "LocalVariableReadNode"
+          vn = @nd_name[recv]
+          # Check if it's a method parameter with a known type
+          mi = 0
+          while mi < @meth_names.length
+            pnames = @meth_param_names[mi].split(",")
+            ptypes = @meth_param_types[mi].split(",")
+            pi = 0
+            while pi < pnames.length
+              if pnames[pi] == vn && pi < ptypes.length
+                if ptypes[pi] != "int"
+                  rt = ptypes[pi]
+                end
+              end
+              pi = pi + 1
+            end
+            mi = mi + 1
+          end
+        end
+        if is_obj_type(rt) == 1
+          bt = base_type(rt)
+          cname = bt[4, bt.length - 4]
+          ci = find_class_idx(cname)
+          if ci >= 0
+            mname = @nd_name[nid]
+            readers = @cls_attr_readers[ci].split(";")
+            rk = 0
+            while rk < readers.length
+              if readers[rk] == mname
+                # Resolve ivar type from initialize body
+                ivt = resolve_ivar_from_init(ci, "@" + mname)
+                if ivt != "" && ivt != "int"
+                  return ivt
+                end
+              end
+              rk = rk + 1
+            end
+          end
+        end
+      end
+    end
+    at
+  end
+
+  # Resolve an ivar's type by scanning the initialize method body
+  def resolve_ivar_from_init(ci, iname)
+    # Check if already resolved
+    ivt = cls_ivar_type(ci, iname)
+    if ivt != "int"
+      return ivt
+    end
+    # Scan initialize body for @ivar = param assignments
+    all_bodies = @cls_meth_bodies[ci].split(";")
+    all_mnames = @cls_meth_names[ci].split(";")
+    all_params = @cls_meth_params[ci].split("|")
+    all_ptypes = @cls_meth_ptypes[ci].split("|")
+    bj = 0
+    while bj < all_mnames.length
+      if all_mnames[bj] == "initialize"
+        bid = all_bodies[bj].to_i
+        if bid >= 0
+          pnames = "".split(",")
+          ptypes = "".split(",")
+          if bj < all_params.length
+            pnames = all_params[bj].split(",")
+          end
+          if bj < all_ptypes.length
+            ptypes = all_ptypes[bj].split(",")
+          end
+          # Find @ivar = param_name in initialize body
+          resolve_ivar_from_body(ci, bid, iname, pnames, ptypes)
+          ivt2 = cls_ivar_type(ci, iname)
+          if ivt2 != "int"
+            return ivt2
+          end
+        end
+      end
+      bj = bj + 1
+    end
+    ""
+  end
+
+  def resolve_ivar_from_body(ci, nid, iname, pnames, ptypes)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "InstanceVariableWriteNode"
+      if @nd_name[nid] == iname
+        expr = @nd_expression[nid]
+        if expr >= 0 && @nd_type[expr] == "LocalVariableReadNode"
+          pn = @nd_name[expr]
+          pi = 0
+          while pi < pnames.length
+            if pnames[pi] == pn && pi < ptypes.length
+              pt = ptypes[pi]
+              if pt != "int"
+                update_ivar_type(ci, iname, pt)
+              end
+            end
+            pi = pi + 1
+          end
+        end
+      end
+    end
+    # Recurse
+    if @nd_body[nid] >= 0
+      resolve_ivar_from_body(ci, @nd_body[nid], iname, pnames, ptypes)
+    end
+    stmts = parse_id_list(@nd_stmts[nid])
+    k = 0
+    while k < stmts.length
+      resolve_ivar_from_body(ci, stmts[k], iname, pnames, ptypes)
+      k = k + 1
+    end
+  end
+
   def detect_poly_params
     # Scan all call sites to detect functions called with different param types
     stmts = get_body_stmts(@root_id)
@@ -5728,7 +5852,7 @@ class Compiler
             ptypes = @meth_param_types[mi].split(",")
             k = 0
             while k < arg_ids.length
-              at = infer_type(arg_ids[k])
+              at = infer_type_deep(arg_ids[k])
               if k < ptypes.length
                 ct = ptypes[k]
                 # Skip rest/splat params (int_array) - they handle multiple args
@@ -6190,14 +6314,15 @@ class Compiler
     infer_main_call_types
     infer_function_body_call_types
     infer_class_body_call_types
-    detect_poly_params
     detect_poly_locals
-    # Re-infer return types after main call type fixes
-    infer_all_returns
-    # Update ivar types from writer calls (after return types are known)
-    infer_ivar_types_from_writers
-    # Re-infer again with updated ivar types
-    infer_all_returns
+    # Iterative type inference: converge param types, return types, ivar types
+    iter = 0
+    while iter < 4
+      infer_all_returns
+      infer_ivar_types_from_writers
+      detect_poly_params
+      iter = iter + 1
+    end
     # Fix lambda return types based on call-site usage
     fix_lambda_return_types
     detect_features
