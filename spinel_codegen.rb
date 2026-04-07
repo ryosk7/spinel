@@ -5444,56 +5444,13 @@ class Compiler
     end
     if t == "CallNode"
       mname = @nd_name[nid]
-      if mname == "to_s"
-        @needs_string_helpers = 1
-      end
-      if mname == "+"
-        if @nd_receiver[nid] >= 0
-          rt = infer_type(@nd_receiver[nid])
-          if rt == "string"
-            @needs_string_helpers = 1
-          end
-        end
-      end
-      if mname == "upcase"
-        @needs_string_helpers = 1
-      end
-      if mname == "<<"
-        @needs_string_helpers = 1
-        if @nd_receiver[nid] >= 0
-          rt = infer_type(@nd_receiver[nid])
-          if rt == "string"
-            @needs_string_helpers = 1
-          end
-        end
-      end
-      if mname == "+"
-        if @nd_receiver[nid] >= 0
-          rt = infer_type(@nd_receiver[nid])
-          if rt == "string"
-            @needs_string_helpers = 1
-          end
-        end
-      end
-      if mname == "downcase"
-        @needs_string_helpers = 1
-      end
-      if mname == "strip"
-        @needs_string_helpers = 1
-      end
-      if mname == "chomp"
-        @needs_string_helpers = 1
-      end
-      if mname == "slice"
-        @needs_string_helpers = 1
-      end
-      if mname == "include?"
-        @needs_string_helpers = 1
-      end
-      if mname == "start_with?"
-        @needs_string_helpers = 1
-      end
-      if mname == "end_with?"
+      # String methods that always need string helpers
+      if mname == "to_s" || mname == "upcase" || mname == "downcase" ||
+         mname == "strip" || mname == "chomp" || mname == "slice" ||
+         mname == "include?" || mname == "start_with?" || mname == "end_with?" ||
+         mname == "gsub" || mname == "index" || mname == "sub" || mname == "tr" ||
+         mname == "ljust" || mname == "rjust" || mname == "capitalize" ||
+         mname == "count" || mname == "<<"
         @needs_string_helpers = 1
       end
       if mname == "split"
@@ -5501,47 +5458,8 @@ class Compiler
         @needs_str_array = 1
         @needs_gc = 1
       end
-      if mname == "gsub"
-        @needs_string_helpers = 1
-      end
-      if mname == "index"
-        @needs_string_helpers = 1
-      end
-      if mname == "sub"
-        @needs_string_helpers = 1
-      end
-      if mname == "tr"
-        @needs_string_helpers = 1
-      end
-      if mname == "ljust"
-        @needs_string_helpers = 1
-      end
-      if mname == "rjust"
-        @needs_string_helpers = 1
-      end
-      if mname == "[]"
-        if @nd_receiver[nid] >= 0
-          rt = infer_type(@nd_receiver[nid])
-          if rt == "string"
-            @needs_string_helpers = 1
-          end
-        end
-      end
-      if mname == "reverse"
-        if @nd_receiver[nid] >= 0
-          rt = infer_type(@nd_receiver[nid])
-          if rt == "string"
-            @needs_string_helpers = 1
-          end
-        end
-      end
-      if mname == "capitalize"
-        @needs_string_helpers = 1
-      end
-      if mname == "count"
-        @needs_string_helpers = 1
-      end
-      if mname == "*"
+      # Methods that need string helpers only when receiver is string
+      if mname == "+" || mname == "*" || mname == "[]" || mname == "reverse"
         if @nd_receiver[nid] >= 0
           rt = infer_type(@nd_receiver[nid])
           if rt == "string"
