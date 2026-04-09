@@ -21,3 +21,4 @@
 /lib/regexp/libspre.a
 lib/libspinel_rt.a
 lib/libspbi.a
+HANDOFF.md
