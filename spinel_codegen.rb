@@ -109,6 +109,7 @@ class Compiler
     @current_method_return = ""
     @in_main = 0
     @in_loop = 0
+    @hoisted_strlen_var = ""
     @in_yield_method = 0
     @in_gc_scope = 0
 
@@ -11317,6 +11318,9 @@ class Compiler
   def compile_string_method_expr(nid, mname, rc)
     @needs_string_helpers = 1
     if mname == "length"
+      if @hoisted_strlen_var != ""
+        return @hoisted_strlen_var
+      end
       return "(mrb_int)strlen(" + rc + ")"
     end
     if mname == "to_i"
@@ -13496,15 +13500,71 @@ class Compiler
     emit("  }")
   end
 
+  # Check if while condition uses strlen and hoist if safe
+  def try_hoist_strlen(pred_nid)
+    # Pattern: i < str.length  →  CallNode(<), recv=i, arg=CallNode(length/size)
+    if @nd_type[pred_nid] != "CallNode"
+      return ""
+    end
+    op = @nd_name[pred_nid]
+    if op != "<" && op != "<=" && op != ">"  && op != ">="
+      return ""
+    end
+    # Find the .length/.size call
+    len_nid = -1
+    args_id = @nd_arguments[pred_nid]
+    if args_id >= 0
+      a = get_args(args_id)
+      if a.length > 0
+        len_nid = a[0]
+      end
+    end
+    # For > or >=, the length call may be on the receiver side
+    if op == ">" || op == ">="
+      len_nid = @nd_receiver[pred_nid]
+    end
+    if len_nid < 0
+      return ""
+    end
+    if @nd_type[len_nid] != "CallNode"
+      return ""
+    end
+    mn = @nd_name[len_nid]
+    if mn != "length" && mn != "size"
+      return ""
+    end
+    recv = @nd_receiver[len_nid]
+    if recv < 0
+      return ""
+    end
+    rt = infer_type(recv)
+    if rt != "string"
+      return ""
+    end
+    # Hoist: emit len variable before the loop
+    tmp = new_temp
+    rc = compile_expr(recv)
+    emit("  mrb_int " + tmp + " = (mrb_int)strlen(" + rc + ");")
+    tmp
+  end
+
   def compile_while_stmt(nid)
     old = @in_loop
     @in_loop = 1
+    # Try to hoist strlen from condition
+    len_tmp = try_hoist_strlen(@nd_predicate[nid])
+    if len_tmp != ""
+      @hoisted_strlen_var = len_tmp
+    end
     cond = compile_expr(@nd_predicate[nid])
     emit("  while (" + cond + ") {")
     @indent = @indent + 1
     compile_stmts_body(@nd_body[nid])
     @indent = @indent - 1
     emit("  }")
+    if len_tmp != ""
+      @hoisted_strlen_var = ""
+    end
     @in_loop = old
   end
 
