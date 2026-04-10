@@ -1912,7 +1912,7 @@ class Compiler
       end
       return "int_array"
     end
-    if mname == "reduce" || mname == "inject"
+    if mname == "reduce" || mname == "inject" || mname == "each_with_object"
       # Return type is the accumulator type, inferred from initial value
       args_id = @nd_arguments[nid]
       if args_id >= 0
@@ -9367,6 +9367,29 @@ class Compiler
                     end
                   elsif mname == "each_char" || mname == "each_line"
                     types.push("string")
+                  elsif mname == "each_with_object"
+                    if bk == 0
+                      # Element
+                      if recv_type == "str_array"
+                        types.push("string")
+                      elsif recv_type == "float_array"
+                        types.push("float")
+                      else
+                        types.push("int")
+                      end
+                    else
+                      # Object accumulator — infer from first argument
+                      args_id = @nd_arguments[nid]
+                      if args_id >= 0
+                        aargs = get_args(args_id)
+                        if aargs.length > 0
+                          types.push(infer_type(aargs[0]))
+                          bk = bk + 1
+                          next
+                        end
+                      end
+                      types.push("int")
+                    end
                   elsif mname == "each_slice" || mname == "each_cons"
                     # Block param is a sub-array of the same type
                     if recv_type == "str_array" || recv_type == "float_array" || recv_type == "int_array"
@@ -12508,6 +12531,18 @@ class Compiler
       end
     end
 
+    # each_with_object as expression: run the loop as side effect, return obj
+    if mname == "each_with_object"
+      if @nd_block[nid] >= 0
+        compile_each_with_object_block(nid)
+        bp2 = get_block_param(nid, 1)
+        if bp2 == ""
+          bp2 = "_obj"
+        end
+        return "lv_" + bp2
+      end
+    end
+
     # select as expression
     if mname == "select"
       if @nd_block[nid] >= 0
@@ -14833,6 +14868,13 @@ class Compiler
       end
     end
 
+    if mname == "each_with_object"
+      if @nd_block[nid] >= 0 && recv >= 0
+        compile_each_with_object_block(nid)
+        return 1
+      end
+    end
+
     # scan with block: str.scan(/re/) { |m| ... }
     if mname == "scan"
       if @nd_block[nid] >= 0
@@ -16297,6 +16339,34 @@ class Compiler
     compile_stmts_body(@nd_body[@nd_block[nid]])
     @indent = @indent - 1
     emit("  }")
+    @in_loop = old
+  end
+
+  def compile_each_with_object_block(nid)
+    old = @in_loop
+    @in_loop = 1
+    rt = infer_type(@nd_receiver[nid])
+    rc = compile_expr(@nd_receiver[nid])
+    obj_arg = compile_arg0(nid)
+    bp1 = get_block_param(nid, 0)
+    bp2 = get_block_param(nid, 1)
+    if bp1 == ""
+      bp1 = "_elem"
+    end
+    if bp2 == ""
+      bp2 = "_obj"
+    end
+    tmp_i = new_temp
+    if rt == "int_array" || rt == "str_array" || rt == "float_array"
+      pfx = array_c_prefix(rt)
+      emit("  lv_" + bp2 + " = " + obj_arg + ";")
+      emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_" + pfx + "_length(" + rc + "); " + tmp_i + "++) {")
+      emit("    lv_" + bp1 + " = sp_" + pfx + "_get(" + rc + ", " + tmp_i + ");")
+      @indent = @indent + 1
+      compile_stmts_body(@nd_body[@nd_block[nid]])
+      @indent = @indent - 1
+      emit("  }")
+    end
     @in_loop = old
   end
 
