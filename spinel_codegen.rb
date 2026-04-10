@@ -1808,6 +1808,27 @@ class Compiler
       end
       return "int_array"
     end
+    if mname == "flat_map"
+      if recv >= 0
+        # Block returns an array; result type matches block return type
+        blk = @nd_block[nid]
+        if blk >= 0
+          bbody = @nd_body[blk]
+          if bbody >= 0
+            bbs = get_stmts(bbody)
+            if bbs.length > 0
+              bret = infer_type(bbs.last)
+              # If block returns an array type, use it as result type
+              if bret == "int_array" || bret == "str_array" || bret == "float_array"
+                return bret
+              end
+            end
+          end
+        end
+        return infer_type(recv)
+      end
+      return "int_array"
+    end
     if mname == "sort_by"
       if recv >= 0
         return infer_type(recv)
@@ -12444,6 +12465,13 @@ class Compiler
       end
     end
 
+    # flat_map as expression
+    if mname == "flat_map"
+      if @nd_block[nid] >= 0
+        return compile_flat_map_expr(nid)
+      end
+    end
+
     # select as expression
     if mname == "select"
       if @nd_block[nid] >= 0
@@ -16267,6 +16295,69 @@ class Compiler
     @indent = @indent - 1
     emit("  }")
     @in_loop = old
+  end
+
+  def compile_flat_map_expr(nid)
+    # flat_map: for each element, block returns an array; concat all results
+    rt = infer_type(@nd_receiver[nid])
+    rc = compile_expr(@nd_receiver[nid])
+    bp1 = get_block_param(nid, 0)
+    if bp1 == ""
+      bp1 = "_x"
+    end
+    # Determine result array type from block return type
+    blk = @nd_block[nid]
+    block_ret = "int_array"
+    if blk >= 0
+      bbody = @nd_body[blk]
+      if bbody >= 0
+        bbs = get_stmts(bbody)
+        if bbs.length > 0
+          block_ret = infer_type(bbs.last)
+        end
+      end
+    end
+    # Fall back to receiver type if block doesn't return an array
+    if block_ret != "int_array" && block_ret != "str_array" && block_ret != "float_array"
+      block_ret = rt
+    end
+    @needs_gc = 1
+    pfx_src = array_c_prefix(rt)
+    pfx_dst = array_c_prefix(block_ret)
+    tmp_arr = new_temp
+    tmp_i = new_temp
+    tmp_inner = new_temp
+    tmp_j = new_temp
+    emit("  " + c_type(block_ret) + tmp_arr + " = sp_" + pfx_dst + "_new();")
+    # Declare block param type from receiver element type
+    elem_type = "int"
+    if rt == "str_array"
+      elem_type = "string"
+    elsif rt == "float_array"
+      elem_type = "float"
+    end
+    declare_var(bp1, elem_type)
+    emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_" + pfx_src + "_length(" + rc + "); " + tmp_i + "++) {")
+    emit("    lv_" + bp1 + " = sp_" + pfx_src + "_get(" + rc + ", " + tmp_i + ");")
+    @indent = @indent + 1
+    bbody2 = @nd_body[blk]
+    if bbody2 >= 0
+      bbs2 = get_stmts(bbody2)
+      # Compile all but last statement
+      k = 0
+      while k < bbs2.length - 1
+        compile_stmt(bbs2[k])
+        k = k + 1
+      end
+      last = bbs2.last
+      val = compile_expr(last)
+      emit("  " + c_type(block_ret) + tmp_inner + " = " + val + ";")
+      emit("  for (mrb_int " + tmp_j + " = 0; " + tmp_j + " < sp_" + pfx_dst + "_length(" + tmp_inner + "); " + tmp_j + "++)")
+      emit("    sp_" + pfx_dst + "_push(" + tmp_arr + ", sp_" + pfx_dst + "_get(" + tmp_inner + ", " + tmp_j + "));")
+    end
+    @indent = @indent - 1
+    emit("  }")
+    tmp_arr
   end
 
   def compile_map_expr(nid)
