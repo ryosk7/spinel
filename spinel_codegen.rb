@@ -1924,7 +1924,7 @@ class Compiler
       end
       return "int_array"
     end
-    if mname == "select"
+    if mname == "select" || mname == "filter"
       if recv >= 0
         return infer_type(recv)
       end
@@ -9351,7 +9351,7 @@ class Compiler
                   end
                   if mname == "times" || mname == "upto" || mname == "downto"
                     types.push("int")
-                  elsif mname == "each" || mname == "each_pair" || mname == "map" || mname == "select" || mname == "reject" || mname == "find" || mname == "detect" || mname == "any?" || mname == "all?" || mname == "none?" || mname == "count" || mname == "min_by" || mname == "max_by" || mname == "sort_by" || mname == "flat_map"
+                  elsif mname == "each" || mname == "each_pair" || mname == "map" || mname == "select" || mname == "filter" || mname == "reject" || mname == "find" || mname == "detect" || mname == "any?" || mname == "all?" || mname == "none?" || mname == "count" || mname == "min_by" || mname == "max_by" || mname == "sort_by" || mname == "flat_map"
                     # Element iteration: infer block param from collection type
                     if recv_type == "str_array"
                       types.push("string")
@@ -12633,7 +12633,7 @@ class Compiler
     end
 
     # select as expression
-    if mname == "select"
+    if mname == "select" || mname == "filter"
       if @nd_block[nid] >= 0
         return compile_select_expr(nid)
       end
