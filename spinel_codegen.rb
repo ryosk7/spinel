@@ -12156,6 +12156,9 @@ class Compiler
       pfx = array_c_prefix(recv_type)
       return "(sp_" + pfx + "_length(" + rc + ") == 0)"
     end
+    if (mname == "any?" || mname == "all?" || mname == "none?") && @nd_block[nid] >= 0
+      return compile_array_predicate_block(nid, rc, recv_type, mname)
+    end
     # Array methods
     if recv_type == "int_array"
       if mname == "length"
@@ -16632,6 +16635,56 @@ class Compiler
     @indent = @indent - 1
     emit("  }")
     @in_loop = old
+  end
+
+  def compile_array_predicate_block(nid, rc, recv_type, mname)
+    # Implements any?/all?/none? with block by short-circuit loop
+    bp1 = get_block_param(nid, 0)
+    if bp1 == ""
+      bp1 = "_x"
+    end
+    # Infer element type for block parameter
+    elem_type = "int"
+    if recv_type == "str_array"
+      elem_type = "string"
+    elsif recv_type == "float_array"
+      elem_type = "float"
+    end
+    declare_var(bp1, elem_type)
+    tmp_res = new_temp
+    tmp_i = new_temp
+    pfx = array_c_prefix(recv_type)
+    init_val = "FALSE"
+    if mname == "all?" || mname == "none?"
+      init_val = "TRUE"
+    end
+    emit("  mrb_bool " + tmp_res + " = " + init_val + ";")
+    emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_" + pfx + "_length(" + rc + "); " + tmp_i + "++) {")
+    emit("    lv_" + bp1 + " = sp_" + pfx + "_get(" + rc + ", " + tmp_i + ");")
+    blk = @nd_block[nid]
+    bbody = @nd_body[blk]
+    bexpr = "0"
+    if bbody >= 0
+      bs = get_stmts(bbody)
+      if bs.length > 0
+        k = 0
+        while k < bs.length - 1
+          compile_stmt(bs[k])
+          k = k + 1
+        end
+        bexpr = compile_expr(bs.last)
+      end
+    end
+    if mname == "any?"
+      emit("    if (" + bexpr + ") { " + tmp_res + " = TRUE; break; }")
+    elsif mname == "all?"
+      emit("    if (!(" + bexpr + ")) { " + tmp_res + " = FALSE; break; }")
+    else
+      # none?
+      emit("    if (" + bexpr + ") { " + tmp_res + " = FALSE; break; }")
+    end
+    emit("  }")
+    tmp_res
   end
 
   def compile_hash_select_reject(nid, hash_type, rc, mname)
