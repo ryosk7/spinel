@@ -11828,6 +11828,13 @@ class Compiler
     if mname == "succ" || mname == "next"
       return "sp_str_succ(" + rc + ")"
     end
+    if mname == "sum"
+      tmp = new_temp
+      itmp = new_temp
+      emit("  mrb_int " + tmp + " = 0;")
+      emit("  for (mrb_int " + itmp + " = 0; " + rc + "[" + itmp + "]; " + itmp + "++) " + tmp + " += (unsigned char)" + rc + "[" + itmp + "];")
+      return tmp
+    end
     if mname == "eql?"
       return "(strcmp(" + rc + ", " + compile_arg0(nid) + ") == 0)"
     end
