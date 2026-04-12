@@ -9463,6 +9463,15 @@ class Compiler
                     else
                       types.push("int")
                     end
+                  elsif mname == "zip"
+                    # Both params get element type from receiver
+                    if recv_type == "str_array"
+                      types.push("string")
+                    elsif recv_type == "float_array"
+                      types.push("float")
+                    else
+                      types.push("int")
+                    end
                   elsif mname == "each_with_index"
                     if bk == 0
                       # Element
@@ -15291,6 +15300,35 @@ class Compiler
     if mname == "each_with_object"
       if @nd_block[nid] >= 0 && recv >= 0
         compile_each_with_object_block(nid)
+        return 1
+      end
+    end
+
+    if mname == "zip"
+      if @nd_block[nid] >= 0 && recv >= 0
+        old = @in_loop
+        @in_loop = 1
+        rt = infer_type(recv)
+        rc = compile_expr(recv)
+        arg = compile_arg0(nid)
+        bp1 = get_block_param(nid, 0)
+        bp2 = get_block_param(nid, 1)
+        if bp1 == ""
+          bp1 = "_a"
+        end
+        if bp2 == ""
+          bp2 = "_b"
+        end
+        pfx = array_c_prefix(rt)
+        tmp_i = new_temp
+        emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_" + pfx + "_length(" + rc + "); " + tmp_i + "++) {")
+        emit("    lv_" + bp1 + " = sp_" + pfx + "_get(" + rc + ", " + tmp_i + ");")
+        emit("    lv_" + bp2 + " = sp_" + pfx + "_get(" + arg + ", " + tmp_i + ");")
+        @indent = @indent + 1
+        compile_stmts_body(@nd_body[@nd_block[nid]])
+        @indent = @indent - 1
+        emit("  }")
+        @in_loop = old
         return 1
       end
     end
