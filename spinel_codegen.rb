@@ -1999,6 +1999,27 @@ class Compiler
     if mname == "zip"
       if recv >= 0
         rt = infer_type(recv)
+        # Check if all zip arguments have the same element type
+        heterogeneous = 0
+        multi_arg = 0
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          aargs = get_args(args_id)
+          if aargs.length > 1
+            multi_arg = 1
+          end
+          k = 0
+          while k < aargs.length
+            at = infer_type(aargs[k])
+            if at != rt
+              heterogeneous = 1
+            end
+            k = k + 1
+          end
+        end
+        if heterogeneous == 1 || multi_arg == 1
+          return "poly_array_ptr_array"
+        end
         if rt == "str_array"
           return "str_array_ptr_array"
         end
@@ -2474,6 +2495,22 @@ class Compiler
   end
 
   # Get element class type from ptr_array type (e.g., "obj_Planet_ptr_array" → "obj_Planet")
+  def elem_type_of_array(t)
+    if t == "int_array"
+      return "int"
+    end
+    if t == "str_array"
+      return "string"
+    end
+    if t == "float_array"
+      return "float"
+    end
+    if is_ptr_array_type(t) == 1
+      return ptr_array_elem_type(t)
+    end
+    "int"
+  end
+
   def ptr_array_elem_type(t)
     if is_ptr_array_type(t) == 1
       return t[0, t.length - 10]
@@ -12354,20 +12391,59 @@ class Compiler
     if recv_type == "str_int_hash" || recv_type == "str_str_hash"
       return ""
     end
-    # zip without block: return array of pairs
+    # zip without block: return array of pairs/tuples
     if mname == "zip" && @nd_block[nid] < 0
       @needs_ptr_array = 1
       @needs_gc = 1
-      pfx = array_c_prefix(recv_type)
-      arg = compile_arg0(nid)
+      pfx_recv = array_c_prefix(recv_type)
+      args_id = @nd_arguments[nid]
+      aargs = get_args(args_id)
+      # Check if heterogeneous or multi-arg
+      heterogeneous = 0
+      k = 0
+      while k < aargs.length
+        at = infer_type(aargs[k])
+        if at != recv_type
+          heterogeneous = 1
+        end
+        k = k + 1
+      end
+      if aargs.length > 1
+        heterogeneous = 1
+      end
+      # Compile all zip arguments
+      arg_rcs = "".split(",")
+      arg_types = "".split(",")
+      k = 0
+      while k < aargs.length
+        arg_rcs.push(compile_expr(aargs[k]))
+        arg_types.push(infer_type(aargs[k]))
+        k = k + 1
+      end
       tmp = new_temp
       itmp = new_temp
       pair_tmp = new_temp
       emit("  sp_PtrArray *" + tmp + " = sp_PtrArray_new();")
-      emit("  for (mrb_int " + itmp + " = 0; " + itmp + " < sp_" + pfx + "_length(" + rc + "); " + itmp + "++) {")
-      emit("    " + c_type(recv_type) + " " + pair_tmp + " = sp_" + pfx + "_new();")
-      emit("    sp_" + pfx + "_push(" + pair_tmp + ", sp_" + pfx + "_get(" + rc + ", " + itmp + "));")
-      emit("    sp_" + pfx + "_push(" + pair_tmp + ", sp_" + pfx + "_get(" + arg + ", " + itmp + "));")
+      emit("  for (mrb_int " + itmp + " = 0; " + itmp + " < sp_" + pfx_recv + "_length(" + rc + "); " + itmp + "++) {")
+      if heterogeneous == 1
+        @needs_rb_value = 1
+        emit("    sp_PolyArray *" + pair_tmp + " = sp_PolyArray_new();")
+        emit("    sp_PolyArray_push(" + pair_tmp + ", " + box_val_to_poly("sp_" + pfx_recv + "_get(" + rc + ", " + itmp + ")", elem_type_of_array(recv_type)) + ");")
+        k = 0
+        while k < arg_rcs.length
+          apfx = array_c_prefix(arg_types[k])
+          emit("    sp_PolyArray_push(" + pair_tmp + ", " + box_val_to_poly("sp_" + apfx + "_get(" + arg_rcs[k] + ", " + itmp + ")", elem_type_of_array(arg_types[k])) + ");")
+          k = k + 1
+        end
+      else
+        emit("    " + c_type(recv_type) + " " + pair_tmp + " = sp_" + pfx_recv + "_new();")
+        emit("    sp_" + pfx_recv + "_push(" + pair_tmp + ", sp_" + pfx_recv + "_get(" + rc + ", " + itmp + "));")
+        k = 0
+        while k < arg_rcs.length
+          emit("    sp_" + pfx_recv + "_push(" + pair_tmp + ", sp_" + pfx_recv + "_get(" + arg_rcs[k] + ", " + itmp + "));")
+          k = k + 1
+        end
+      end
       emit("    sp_PtrArray_push(" + tmp + ", " + pair_tmp + ");")
       emit("  }")
       return tmp
