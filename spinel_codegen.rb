@@ -156,6 +156,7 @@ class Compiler
     @needs_str_array = 0
     @needs_str_int_hash = 0
     @needs_str_str_hash = 0
+    @needs_sym_int_hash = 0
     @needs_string_helpers = 0
     @needs_setjmp = 0
     @needs_file_io = 0
@@ -2688,6 +2689,9 @@ class Compiler
     if t == "str_str_hash"
       return 1
     end
+    if t == "sym_int_hash"
+      return 1
+    end
     if t == "lambda"
       return 1
     end
@@ -2759,6 +2763,9 @@ class Compiler
       return 1
     end
     if bt == "str_int_hash" || bt == "str_str_hash"
+      return 1
+    end
+    if bt == "sym_int_hash"
       return 1
     end
     if bt == "stringio" || bt == "lambda" || bt == "poly_array"
@@ -2842,6 +2849,9 @@ class Compiler
     end
     if t == "str_str_hash"
       return "sp_StrStrHash *"
+    end
+    if t == "sym_int_hash"
+      return "sp_SymIntHash *"
     end
     if is_tuple_type(t) == 1
       return tuple_c_name(t) + " *"
@@ -7515,6 +7525,21 @@ class Compiler
     emit_raw("")
   end
 
+  # Symbol-keyed hash with integer values. Keys are sp_sym (mrb_int);
+  # the empty-slot sentinel is -1 (= invalid sp_sym, same as default).
+  def emit_sym_int_hash_runtime
+    emit_raw("typedef struct{sp_sym*keys;mrb_int*vals;sp_sym*order;mrb_int len;mrb_int cap;mrb_int mask;}sp_SymIntHash;")
+    emit_raw("static void sp_SymIntHash_fin(void*p){sp_SymIntHash*h=(sp_SymIntHash*)p;free(h->keys);free(h->vals);free(h->order);}")
+    emit_raw("static sp_SymIntHash*sp_SymIntHash_new(void){sp_SymIntHash*h=(sp_SymIntHash*)sp_gc_alloc(sizeof(sp_SymIntHash),sp_SymIntHash_fin,NULL);h->cap=16;h->mask=15;h->keys=(sp_sym*)malloc(sizeof(sp_sym)*h->cap);for(mrb_int i=0;i<h->cap;i++)h->keys[i]=-1;h->vals=(mrb_int*)calloc(h->cap,sizeof(mrb_int));h->order=(sp_sym*)malloc(sizeof(sp_sym)*h->cap);h->len=0;return h;}")
+    emit_raw("static void sp_SymIntHash_grow(sp_SymIntHash*h){mrb_int oc=h->cap;sp_sym*ok=h->keys;mrb_int*ov=h->vals;h->cap*=2;h->mask=h->cap-1;h->keys=(sp_sym*)malloc(sizeof(sp_sym)*h->cap);for(mrb_int i=0;i<h->cap;i++)h->keys[i]=-1;h->vals=(mrb_int*)calloc(h->cap,sizeof(mrb_int));h->order=(sp_sym*)realloc(h->order,sizeof(sp_sym)*h->cap);h->len=0;for(mrb_int i=0;i<oc;i++){if(ok[i]>=0){mrb_int idx=(mrb_int)(((mrb_int)ok[i])&h->mask);while(h->keys[idx]>=0)idx=(idx+1)&h->mask;h->keys[idx]=ok[i];h->vals[idx]=ov[i];h->len++;}}free(ok);free(ov);}")
+    emit_raw("static mrb_int sp_SymIntHash_get(sp_SymIntHash*h,sp_sym k){mrb_int idx=(mrb_int)(((mrb_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k)return h->vals[idx];idx=(idx+1)&h->mask;}return 0;}")
+    emit_raw("static void sp_SymIntHash_set(sp_SymIntHash*h,sp_sym k,mrb_int v){if(h->len*2>=h->cap)sp_SymIntHash_grow(h);mrb_int idx=(mrb_int)(((mrb_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k){h->vals[idx]=v;return;}idx=(idx+1)&h->mask;}h->keys[idx]=k;h->vals[idx]=v;h->order[h->len]=k;h->len++;}")
+    emit_raw("static mrb_bool sp_SymIntHash_has_key(sp_SymIntHash*h,sp_sym k){mrb_int idx=(mrb_int)(((mrb_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k)return TRUE;idx=(idx+1)&h->mask;}return FALSE;}")
+    emit_raw("static mrb_int sp_SymIntHash_length(sp_SymIntHash*h){return h->len;}")
+    emit_raw("static void sp_SymIntHash_delete(sp_SymIntHash*h,sp_sym k){mrb_int idx=(mrb_int)(((mrb_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k){h->keys[idx]=-1;h->vals[idx]=0;h->len--;mrb_int j=(idx+1)&h->mask;while(h->keys[j]>=0){mrb_int nj=(mrb_int)(((mrb_int)h->keys[j])&h->mask);if((j>idx&&(nj<=idx||nj>j))||(j<idx&&nj<=idx&&nj>j)){h->keys[idx]=h->keys[j];h->vals[idx]=h->vals[j];h->keys[j]=-1;h->vals[j]=0;idx=j;}j=(j+1)&h->mask;}return;}idx=(idx+1)&h->mask;}}")
+    emit_raw("")
+  end
+
   def emit_str_str_hash_runtime
     emit_raw("typedef struct{const char**keys;const char**vals;const char**order;mrb_int len;mrb_int cap;mrb_int mask;}sp_StrStrHash;")
     emit_raw("static void sp_StrStrHash_fin(void*p){sp_StrStrHash*h=(sp_StrStrHash*)p;free(h->keys);free(h->vals);free(h->order);}")
@@ -7584,6 +7609,9 @@ class Compiler
       i = i + 1
     end
     emit_raw("")
+    if @needs_sym_int_hash == 1
+      emit_sym_int_hash_runtime
+    end
   end
 
   # Index of symbol name in @sym_names, or -1 if not found.
@@ -8366,6 +8394,9 @@ class Compiler
         @needs_gc = 1
       end
       if @needs_str_int_hash == 1 || @needs_str_str_hash == 1
+        @needs_gc = 1
+      end
+      if @needs_sym_int_hash == 1
         @needs_gc = 1
       end
       if @needs_mutable_str == 1 || @needs_stringio == 1
