@@ -1137,7 +1137,7 @@ class Compiler
         return "poly_array"
       end
       # Check if all elements are the same array type → array of arrays
-      if et == "int_array" || et == "str_array" || et == "float_array"
+      if et == "int_array" || et == "str_array" || et == "float_array" || et == "sym_array"
         all_same = 1
         k = 1
         while k < elems.length
@@ -1406,7 +1406,7 @@ class Compiler
         if lt == "poly"
           return "poly"
         end
-        if lt == "int_array" || lt == "str_array" || lt == "float_array"
+        if lt == "int_array" || lt == "str_array" || lt == "float_array" || lt == "sym_array"
           return lt
         end
         if lt == "float"
@@ -1893,6 +1893,9 @@ class Compiler
         if rt == "str_array"
           return "string"
         end
+        if rt == "sym_array"
+          return "symbol"
+        end
         if rt == "float_array"
           return "float"
         end
@@ -1979,6 +1982,9 @@ class Compiler
         if rt == "str_array"
           return "string"
         end
+        if rt == "sym_array"
+          return "symbol"
+        end
       end
       return "int"
     end
@@ -1987,6 +1993,9 @@ class Compiler
         rt = infer_type(recv)
         if rt == "str_array"
           return "string"
+        end
+        if rt == "sym_array"
+          return "symbol"
         end
       end
       return "int"
@@ -2015,6 +2024,9 @@ class Compiler
         end
         if rt == "str_array"
           return "string"
+        end
+        if rt == "sym_array"
+          return "symbol"
         end
         if rt == "float_array"
           return "float"
@@ -2066,7 +2078,7 @@ class Compiler
             if bbs.length > 0
               bret = infer_type(bbs.last)
               # If block returns an array type, use it as result type
-              if bret == "int_array" || bret == "str_array" || bret == "float_array"
+              if bret == "int_array" || bret == "str_array" || bret == "float_array" || bret == "sym_array"
                 return bret
               end
             end
@@ -2814,7 +2826,7 @@ class Compiler
     if bt == "string" || bt == "mutable_str"
       return 1
     end
-    if bt == "int_array" || bt == "str_array" || bt == "float_array"
+    if bt == "int_array" || bt == "str_array" || bt == "float_array" || bt == "sym_array"
       return 1
     end
     if bt == "str_int_hash" || bt == "str_str_hash"
@@ -7698,6 +7710,9 @@ class Compiler
     emit_raw("static sp_sym sp_sym_intern(const char *s){mrb_int i;for(i=0;i<SP_SYM_COUNT;i++){if(strcmp(sp_sym_names[i],s)==0)return (sp_sym)i;}for(i=0;i<sp_sym_dyn_count;i++){if(strcmp(sp_sym_dyn_names[i],s)==0)return (sp_sym)(SP_SYM_COUNT+i);}if(sp_sym_dyn_count>=sp_sym_dyn_cap){sp_sym_dyn_cap=sp_sym_dyn_cap?sp_sym_dyn_cap*2:8;sp_sym_dyn_names=(const char**)realloc(sp_sym_dyn_names,sizeof(char*)*sp_sym_dyn_cap);}{size_t sl=strlen(s);char*dup=(char*)malloc(sl+1);memcpy(dup,s,sl+1);sp_sym_dyn_names[sp_sym_dyn_count]=dup;}return (sp_sym)(SP_SYM_COUNT+sp_sym_dyn_count++);}")
     emit_raw("static const char *sp_sym_to_s(sp_sym id) __attribute__((unused));")
     emit_raw("static const char *sp_sym_to_s(sp_sym id){if(id<0)return \"\";if(id<SP_SYM_COUNT)return sp_sym_names[id];mrb_int idx=(mrb_int)id-SP_SYM_COUNT;if(idx>=sp_sym_dyn_count)return \"\";return sp_sym_dyn_names[idx];}")
+    # Sort comparator for sym arrays: lexical by symbol name.
+    emit_raw("static int sp_sym_sort_cmp(const void*a,const void*b){return strcmp(sp_sym_to_s(*(const sp_sym*)a),sp_sym_to_s(*(const sp_sym*)b));}")
+    emit_raw("static void sp_sym_array_sort(sp_IntArray*a){qsort(a->data+a->start,a->len,sizeof(mrb_int),sp_sym_sort_cmp);}")
     # Emit SPS_<name> defines for symbols that form valid C identifiers.
     i = 0
     while i < @sym_names.length
@@ -10015,6 +10030,8 @@ class Compiler
                       # Element
                       if recv_type == "str_array"
                         types.push("string")
+                      elsif recv_type == "sym_array"
+                        types.push("symbol")
                       elsif recv_type == "float_array"
                         types.push("float")
                       elsif is_ptr_array_type(recv_type) == 1
@@ -12108,7 +12125,7 @@ class Compiler
         @needs_string_helpers = 1
         return "sp_poly_add(" + compile_expr(recv) + ", " + box_expr_to_poly(@nd_arguments[nid] >= 0 ? get_args(@nd_arguments[nid])[0] : -1) + ")"
       end
-      if lt == "int_array" || lt == "str_array" || lt == "float_array"
+      if lt == "int_array" || lt == "str_array" || lt == "float_array" || lt == "sym_array"
         rc = compile_expr(recv)
         arg = compile_arg0(nid)
         pfx = array_c_prefix(lt)
@@ -13357,6 +13374,11 @@ class Compiler
         end
       end
       if mname == "sort"
+        if recv_type == "sym_array"
+          tmp = new_temp
+          emit("  sp_IntArray *" + tmp + " = sp_IntArray_dup(" + rc + "); sp_sym_array_sort(" + tmp + ");")
+          return tmp
+        end
         return "sp_IntArray_sort(" + rc + ")"
       end
       if mname == "first"
@@ -16148,7 +16170,7 @@ class Compiler
     if mname == "concat"
       if recv >= 0
         rt = infer_type(recv)
-        if rt == "int_array" || rt == "str_array" || rt == "float_array"
+        if rt == "int_array" || rt == "str_array" || rt == "float_array" || rt == "sym_array"
           rc = compile_expr(recv)
           arg = compile_arg0(nid)
           pfx = array_c_prefix(rt)
@@ -16280,6 +16302,10 @@ class Compiler
       if recv >= 0
         rt = infer_type(recv)
         rc = compile_expr(recv)
+        if rt == "sym_array"
+          emit("  sp_sym_array_sort(" + rc + ");")
+          return 1
+        end
         if rt == "int_array"
           emit("  sp_IntArray_sort_bang(" + rc + ");")
           return 1
@@ -17918,12 +17944,12 @@ class Compiler
               else
                 if at == "str_array"
                   emit("  { sp_StrArray *_pa = " + val + "; for (mrb_int _pi = 0; _pi < _pa->len; _pi++) puts(_pa->data[_pi]); }")
+                elsif at == "sym_array"
+                  emit("  { sp_IntArray *_pa = " + val + "; for (mrb_int _pi = 0; _pi < _pa->len; _pi++) puts(sp_sym_to_s((sp_sym)_pa->data[_pa->start + _pi])); }")
+                elsif at == "int_array"
+                  emit("  { sp_IntArray *_pa = " + val + "; for (mrb_int _pi = 0; _pi < _pa->len; _pi++) printf(\"%lld" + bsl_n + "\", (long long)_pa->data[_pa->start + _pi]); }")
                 else
-                  if at == "int_array"
-                    emit("  { sp_IntArray *_pa = " + val + "; for (mrb_int _pi = 0; _pi < _pa->len; _pi++) printf(\"%lld" + bsl_n + "\", (long long)_pa->data[_pa->start + _pi]); }")
-                  else
-                    emit("  printf(\"%lld" + bsl_n + "\", (long long)" + val + ");")
-                  end
+                  emit("  printf(\"%lld" + bsl_n + "\", (long long)" + val + ");")
                 end
               end
             end
@@ -18094,7 +18120,7 @@ class Compiler
       bp2 = "_obj"
     end
     tmp_i = new_temp
-    if rt == "int_array" || rt == "str_array" || rt == "float_array"
+    if rt == "int_array" || rt == "str_array" || rt == "float_array" || rt == "sym_array"
       pfx = array_c_prefix(rt)
       emit("  lv_" + bp2 + " = " + obj_arg + ";")
       emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_" + pfx + "_length(" + rc + "); " + tmp_i + "++) {")
@@ -18792,7 +18818,7 @@ class Compiler
       end
     end
     # Fall back to receiver type if block doesn't return an array
-    if block_ret != "int_array" && block_ret != "str_array" && block_ret != "float_array"
+    if block_ret != "int_array" && block_ret != "str_array" && block_ret != "float_array" && block_ret != "sym_array"
       block_ret = rt
     end
     @needs_gc = 1
@@ -18847,7 +18873,7 @@ class Compiler
     end
     tmp_arr = new_temp
     tmp_i = new_temp
-    if rt == "int_array"
+    if rt == "int_array" || rt == "sym_array"
       @needs_int_array = 1
       @needs_gc = 1
       # Check if block body returns string (for map that produces StrArray)
@@ -18957,7 +18983,7 @@ class Compiler
     end
     tmp_arr = new_temp
     tmp_i = new_temp
-    if rt == "int_array"
+    if rt == "int_array" || rt == "sym_array"
       @needs_int_array = 1
       @needs_gc = 1
       emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
@@ -19034,7 +19060,7 @@ class Compiler
       bp1 = "_x"
     end
     rt = infer_type(@nd_receiver[nid])
-    if rt == "int_array"
+    if rt == "int_array" || rt == "sym_array"
       @needs_int_array = 1
       tmp_arr = new_temp
       emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
@@ -19929,7 +19955,7 @@ class Compiler
     end
     tmp_arr = new_temp
     tmp_i = new_temp
-    if rt == "int_array"
+    if rt == "int_array" || rt == "sym_array"
       emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
       emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
       emit("    lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
