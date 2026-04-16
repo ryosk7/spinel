@@ -1075,6 +1075,21 @@ class Compiler
     elems = parse_id_list(@nd_elements[nid])
     if elems.length > 0
       et = infer_type(elems[0])
+      if et == "symbol"
+        # Check if ALL elements are symbols
+        all_sym = 1
+        k = 1
+        while k < elems.length
+          if infer_type(elems[k]) != "symbol"
+            all_sym = 0
+          end
+          k = k + 1
+        end
+        if all_sym == 1
+          return "sym_array"
+        end
+        return "poly_array"
+      end
       if et == "string"
         # Check if ALL elements are strings
         all_str = 1
@@ -2205,6 +2220,9 @@ class Compiler
         if rt == "int_array"
           return "int"
         end
+        if rt == "sym_array"
+          return "symbol"
+        end
         if rt == "float_array"
           return "float"
         end
@@ -2630,6 +2648,9 @@ class Compiler
     if t == "float_array"
       return "float"
     end
+    if t == "sym_array"
+      return "symbol"
+    end
     if is_ptr_array_type(t) == 1
       return ptr_array_elem_type(t)
     end
@@ -2723,6 +2744,9 @@ class Compiler
     if t == "sym_str_hash"
       return 1
     end
+    if t == "sym_array"
+      return 1
+    end
     if t == "lambda"
       return 1
     end
@@ -2796,7 +2820,7 @@ class Compiler
     if bt == "str_int_hash" || bt == "str_str_hash"
       return 1
     end
-    if bt == "sym_int_hash" || bt == "sym_str_hash"
+    if bt == "sym_int_hash" || bt == "sym_str_hash" || bt == "sym_array"
       return 1
     end
     if bt == "stringio" || bt == "lambda" || bt == "poly_array"
@@ -2886,6 +2910,10 @@ class Compiler
     end
     if t == "sym_str_hash"
       return "sp_SymStrHash *"
+    end
+    if t == "sym_array"
+      # sym_array is an IntArray internally (sp_sym = mrb_int)
+      return "sp_IntArray *"
     end
     if is_tuple_type(t) == 1
       return tuple_c_name(t) + " *"
@@ -9929,6 +9957,8 @@ class Compiler
                       types.push("string")
                     elsif recv_type == "float_array"
                       types.push("float")
+                    elsif recv_type == "sym_array"
+                      types.push("symbol")
                     elsif recv_type == "str_int_hash"
                       if bk == 0
                         types.push("string")
@@ -9937,6 +9967,18 @@ class Compiler
                       end
                     elsif recv_type == "str_str_hash"
                       types.push("string")
+                    elsif recv_type == "sym_int_hash"
+                      if bk == 0
+                        types.push("symbol")
+                      else
+                        types.push("int")
+                      end
+                    elsif recv_type == "sym_str_hash"
+                      if bk == 0
+                        types.push("symbol")
+                      else
+                        types.push("string")
+                      end
                     elsif recv_type == "poly_array"
                       types.push("poly")
                       @needs_rb_value = 1
@@ -13243,7 +13285,7 @@ class Compiler
       return compile_array_min_max_block(nid, rc, recv_type, mname)
     end
     # Array methods
-    if recv_type == "int_array"
+    if recv_type == "int_array" || recv_type == "sym_array"
       if mname == "length"
         return "sp_IntArray_length(" + rc + ")"
       end
@@ -18042,6 +18084,17 @@ class Compiler
       @indent = @indent - 1
       emit("  }")
     end
+    if rt == "sym_array"
+      tmp = new_temp
+      emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < sp_IntArray_length(" + rc + "); " + tmp + "++) {")
+      if has_bp == 1
+        emit("    lv_" + bp1 + " = (sp_sym)sp_IntArray_get(" + rc + ", " + tmp + ");")
+      end
+      @indent = @indent + 1
+      compile_stmts_body(@nd_body[@nd_block[nid]])
+      @indent = @indent - 1
+      emit("  }")
+    end
     if is_ptr_array_type(rt) == 1
       elem_type = ptr_array_elem_type(rt)
       tmp = new_temp
@@ -18074,6 +18127,30 @@ class Compiler
       emit("    lv_" + bp1 + " = " + rc + "->order[" + tmp + "];")
       if bp2 != ""
         emit("    lv_" + bp2 + " = sp_StrStrHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
+      end
+      @indent = @indent + 1
+      compile_stmts_body(@nd_body[@nd_block[nid]])
+      @indent = @indent - 1
+      emit("  }")
+    end
+    if rt == "sym_int_hash"
+      tmp = new_temp
+      emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < " + rc + "->len; " + tmp + "++) {")
+      emit("    lv_" + bp1 + " = " + rc + "->order[" + tmp + "];")
+      if bp2 != ""
+        emit("    lv_" + bp2 + " = sp_SymIntHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
+      end
+      @indent = @indent + 1
+      compile_stmts_body(@nd_body[@nd_block[nid]])
+      @indent = @indent - 1
+      emit("  }")
+    end
+    if rt == "sym_str_hash"
+      tmp = new_temp
+      emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < " + rc + "->len; " + tmp + "++) {")
+      emit("    lv_" + bp1 + " = " + rc + "->order[" + tmp + "];")
+      if bp2 != ""
+        emit("    lv_" + bp2 + " = sp_SymStrHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
       end
       @indent = @indent + 1
       compile_stmts_body(@nd_body[@nd_block[nid]])
