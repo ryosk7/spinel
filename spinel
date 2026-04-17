@@ -117,12 +117,19 @@ fi
 
 # Step 3: Compile C -> binary
 BIN_FILE="${OUTPUT:-$BASENAME}"
-# Auto-detect regexp usage and link libspre.a
-RE_LIB="$DIR/lib/regexp/libspre.a"
-if grep -q 're_compile' "$C_FILE" 2>/dev/null && [ -f "$RE_LIB" ]; then
-  EXTRA_FLAGS="$EXTRA_FLAGS $RE_LIB -Ilib/regexp"
+# Runtime library (bigint + regexp)
+SP_RT_LIB="$DIR/lib/libspinel_rt.a"
+INCLUDE_FLAGS="-I$DIR/lib"
+if [ -f "$SP_RT_LIB" ]; then
+  EXTRA_FLAGS="$EXTRA_FLAGS $SP_RT_LIB"
 fi
-$CC_CMD -O${OPT_LEVEL} -Wno-all -ffunction-sections -fdata-sections "$C_FILE" -lm $EXTRA_FLAGS -Wl,--gc-sections -o "$BIN_FILE"
+# Legacy: optional standalone regexp lib (retained for backward compat)
+RE_LIB="$DIR/lib/regexp/libspre.a"
+if grep -q 're_compile' "$C_FILE" 2>/dev/null && [ ! -f "$SP_RT_LIB" ] && [ -f "$RE_LIB" ]; then
+  EXTRA_FLAGS="$EXTRA_FLAGS $RE_LIB"
+fi
+INCLUDE_FLAGS="$INCLUDE_FLAGS -I$DIR/lib/regexp"
+$CC_CMD -O${OPT_LEVEL} -Wno-all -ffunction-sections -fdata-sections $INCLUDE_FLAGS "$C_FILE" -lm $EXTRA_FLAGS -Wl,--gc-sections -o "$BIN_FILE"
 if [ $? -ne 0 ]; then
   echo "spinel: C compilation failed" >&2
   exit 1
