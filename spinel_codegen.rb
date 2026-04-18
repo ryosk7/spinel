@@ -13899,7 +13899,7 @@ class Compiler
         return "sp_PtrArray_length(" + rc + ")"
       end
       if mname == "[]"
-        return "(" + ct + ")sp_PtrArray_get(" + rc + ", " + compile_arg0(nid) + ")"
+        return "((" + ct + ")sp_PtrArray_get(" + rc + ", " + compile_arg0(nid) + "))"
       end
       if mname == "push"
         return "(sp_PtrArray_push(" + rc + ", " + compile_arg0(nid) + "), 0)"
