@@ -78,44 +78,48 @@ gen2.c == gen3.c   (bootstrap loop closed)
 
 ## Benchmarks
 
-52/53 benchmarks pass. 65 tests pass.
+75 tests pass. 52/54 benchmarks pass (2 pre-existing failures).
+Geometric mean: **~49x faster** than CRuby across 50 benchmarks.
 
 ### Computation
 
 | Benchmark | Spinel | CRuby | Speedup |
-|-----------|--------|-------|---------|
-| life (Game of Life) | 2 ms | 1,487 ms | **743x** |
-| ackermann | 6 ms | 397 ms | **66x** |
-| mandelbrot | 24 ms | 1,179 ms | **49x** |
-| matmul | 8 ms | 319 ms | **39x** |
-| nqueens | 770 ms | 25,600 ms | **33x** |
-| tarai | 16 ms | 433 ms | **27x** |
-| tak | 22 ms | 506 ms | **23x** |
-| sudoku | 7 ms | 148 ms | **21x** |
-| sieve | 20 ms | 410 ms | **20x** |
-| partial_sums | 82 ms | 1,282 ms | **15x** |
+|---|---|---|---|
+| ackermann | 5 ms | 394 ms | **78.8x** |
+| fib (recursive) | 11 ms | 560 ms | **50.9x** |
+| mandelbrot | 24 ms | 1,187 ms | **49.5x** |
+| matmul | 9 ms | 329 ms | **36.6x** |
+| fasta (DNA seq gen) | 2 ms | 72 ms | **36.0x** |
+| fannkuch | 2 ms | 71 ms | **35.5x** |
+| nqueens | 777 ms | 24,912 ms | **32.1x** |
+| tarai | 16 ms | 423 ms | **26.4x** |
+| tak | 20 ms | 499 ms | **24.9x** |
+| sudoku | 6 ms | 148 ms | **24.7x** |
+| partial_sums | 81 ms | 1,282 ms | **15.8x** |
+| sieve | 38 ms | 435 ms | **11.4x** |
 
 ### Data Structures & GC
 
 | Benchmark | Spinel | CRuby | Speedup |
-|-----------|--------|-------|---------|
-| rbtree (red-black tree) | 18 ms | 579 ms | **32x** |
-| splay tree | 10 ms | 210 ms | **21x** |
-| so_lists | 29 ms | 520 ms | **17x** |
-| gcbench | 486 ms | 4,425 ms | **9x** |
-| linked_list | 63 ms | 484 ms | **7.7x** |
-| binary_trees | 5 ms | 80 ms | **16x** |
+|---|---|---|---|
+| rbtree (red-black tree) | 23 ms | 571 ms | **24.8x** |
+| splay tree | 14 ms | 241 ms | **17.2x** |
+| binary_trees | 11 ms | 105 ms | **9.5x** |
+| so_lists | 74 ms | 510 ms | **6.9x** |
+| linked_list | 101 ms | 455 ms | **4.5x** |
+| gcbench | 1,634 ms | 4,247 ms | **2.6x** |
 
 ### Real-World Programs
 
 | Benchmark | Spinel | CRuby | Speedup |
-|-----------|--------|-------|---------|
-| fasta (DNA seq gen) | 1,260 ms | 7,700 ms | **6.1x** |
-| io_wordcount | 29 ms | 151 ms | **5.2x** |
-| json_parse | 104 ms | 453 ms | **4.4x** |
-| template engine | 227 ms | 983 ms | **4.3x** |
-| csv_process | 273 ms | 952 ms | **3.5x** |
-| pidigits (bigint) | 6,300 ms | 11,600 ms | **1.8x** |
+|---|---|---|---|
+| bigint_fib (1000 digits) | 2 ms | 66 ms | **33.0x** |
+| pidigits (bigint) | 2 ms | 65 ms | **32.5x** |
+| str_concat | 2 ms | 67 ms | **33.5x** |
+| json_parse | 38 ms | 436 ms | **11.5x** |
+| template engine | 137 ms | 961 ms | **7.0x** |
+| io_wordcount | 26 ms | 153 ms | **5.9x** |
+| csv_process | 229 ms | 936 ms | **4.1x** |
 
 ## Supported Ruby Features
 
@@ -147,6 +151,10 @@ type-mismatch detection at compile time.
 for O(n) in-place append. `+`, interpolation, `tr`, `ljust`/`rjust`/`center`,
 and all standard methods work on both. Character comparisons like
 `s[i] == "c"` are optimized to direct char array access (zero allocation).
+Chained concatenation (`a + b + c + d`) collapses to a single malloc
+via `sp_str_concat4` / `sp_str_concat_arr` -- N-1 fewer allocations.
+Loop-local `str.split(sep)` reuses the same `sp_StrArray` across
+iterations (csv_process: 4 M allocations eliminated).
 
 **Regexp**: Built-in NFA regexp engine (no external dependency).
 `=~`, `$1`-`$9`, `match?`, `gsub(/re/, str)`, `sub(/re/, str)`,
@@ -161,24 +169,66 @@ library -- only included when used.
 variables via heap-promoted cells.
 
 **Memory**: Mark-and-sweep GC with size-segregated free lists, non-recursive
-marking, and sticky mark bits. Small classes (<=4 fields, no inheritance,
-no mutation through parameters) are automatically stack-allocated as
-**value types**. Programs using only value types emit no GC runtime at all.
+marking, and sticky mark bits. Small classes (≤8 scalar fields, no
+inheritance, no mutation through parameters) are automatically
+stack-allocated as **value types** -- 1M allocations of a 5-field class
+drop from 85 ms to 2 ms. Programs using only value types emit no GC
+runtime at all.
+
+**Symbols**: Separate `sp_sym` type, distinct from strings (`:a != "a"`).
+Symbol literals are interned at compile time (`SPS_name` constants);
+`String#to_sym` uses a dynamic pool only when needed. Symbol-keyed
+hashes (`{a: 1}`) use a dedicated `sp_SymIntHash` that stores
+`sp_sym` (integer) keys directly rather than strings -- no strcmp, no
+dynamic string allocation.
 
 **I/O**: `puts`, `print`, `printf`, `p`, `gets`, `ARGV`, `ENV[]`,
 `File.read/write/open` (with blocks), `system()`, backtick.
+
+## Optimizations
+
+Whole-program type inference drives several compile-time optimizations:
+
+- **Value-type promotion**: small immutable classes (≤8 scalar fields)
+  become C structs on the stack, eliminating GC overhead entirely.
+- **Constant propagation**: simple literal constants (`N = 100`) are
+  inlined at use sites instead of going through `cst_N` runtime lookup.
+- **Loop-invariant length hoisting**: `while i < arr.length` evaluates
+  `arr.length` once before the loop; `while i < str.length` hoists
+  `strlen`. Mutation of the receiver inside the body (e.g. `arr.push`)
+  correctly disables the hoist.
+- **Method inlining**: short methods (≤3 statements, non-recursive)
+  get `static inline` so gcc can inline them at call sites.
+- **String concat chain flattening**: `a + b + c + d` compiles to a
+  single `sp_str_concat4` / `sp_str_concat_arr` call -- one malloc
+  instead of N-1 intermediate strings.
+- **Bigint auto-promotion**: loops with `x = x * y` or fibonacci-style
+  `c = a + b` self-referential addition auto-promote to bigint.
+- **Bigint `to_s`**: divide-and-conquer O(n log²n) via mruby-bigint's
+  `mpz_get_str` instead of naive O(n²).
+- **Static symbol interning**: `"literal".to_sym` resolves to a
+  compile-time `SPS_<name>` constant; the runtime dynamic pool is
+  only emitted when dynamic interning is actually used.
+- **`strlen` caching in sub_range**: when a string's length is
+  hoisted, `str[i]` accesses use `sp_str_sub_range_len` to skip the
+  internal strlen call.
+- **split reuse**: `fields = line.split(",")` inside a loop reuses
+  the existing `sp_StrArray` rather than allocating a new one.
+- **Dead-code elimination**: compiled with `-ffunction-sections
+  -fdata-sections` and linked with `--gc-sections`; each unused
+  runtime function is stripped from the final binary.
 
 ## Architecture
 
 ```
 spinel                One-command wrapper script (POSIX shell)
 spinel_parse.c        C frontend: libprism → text AST (1,061 lines)
-spinel_codegen.rb     Compiler backend: AST → C code (17,162 lines)
-lib/sp_runtime.h      Runtime library header (455 lines)
-lib/sp_bigint.c       Arbitrary precision integers (5,406 lines)
-lib/regexp/           Built-in regexp engine (1,759 lines)
-test/                 65 feature tests
-benchmark/            53 benchmarks
+spinel_codegen.rb     Compiler backend: AST → C code (20,851 lines)
+lib/sp_runtime.h      Runtime library header (581 lines)
+lib/sp_bigint.c       Arbitrary precision integers (5,394 lines)
+lib/regexp/           Built-in regexp engine (1,626 lines)
+test/                 75 feature tests
+benchmark/            54 benchmarks
 Makefile              Build automation
 ```
 
@@ -206,8 +256,8 @@ by inlining the referenced file.
 
 ```bash
 make              # build parser + regexp library + bootstrap compiler
-make test         # run 65 feature tests (requires bootstrap)
-make bench        # run 53 benchmarks (requires bootstrap)
+make test         # run 75 feature tests (requires bootstrap)
+make bench        # run 54 benchmarks (requires bootstrap)
 make bootstrap    # rebuild compiler from source
 sudo make install # install to /usr/local (spinel in PATH)
 make clean        # remove build artifacts
