@@ -16629,9 +16629,9 @@ class Compiler
         if rt == "mutable_str"
           @needs_mutable_str = 1
           rc = compile_expr(recv)
-          arg = @nd_arguments[nid]
-          if arg >= 0
-            argl = parse_id_list(@nd_args[arg])
+          arg_id = @nd_arguments[nid]
+          if arg_id >= 0
+            argl = parse_id_list(@nd_args[arg_id])
             if argl.length > 0
               at = infer_type(argl[0])
               val = compile_expr(argl[0])
