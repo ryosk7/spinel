@@ -164,6 +164,8 @@ class Compiler
     @needs_str_str_hash = 0
     @needs_sym_int_hash = 0
     @needs_sym_str_hash = 0
+    @needs_str_poly_hash = 0
+    @needs_sym_poly_hash = 0
     @needs_sym_intern = 0
     @needs_string_helpers = 0
     @needs_setjmp = 0
@@ -1286,8 +1288,12 @@ class Compiler
             return "sym_int_hash"
           end
         else
-          # Mixed value types - store as str_str_hash with auto-conversion
-          return "str_str_hash"
+          # Mixed value types: use a *_poly_hash so each slot carries its
+          # own tag (sp_RbVal) rather than coercing everything to one type.
+          if all_sym_keys == 1
+            return "sym_poly_hash"
+          end
+          return "str_poly_hash"
         end
       end
     end
@@ -2344,6 +2350,12 @@ class Compiler
         if rt == "sym_str_hash"
           return "string"
         end
+        if rt == "sym_poly_hash"
+          return "poly"
+        end
+        if rt == "str_poly_hash"
+          return "poly"
+        end
         if rt == "argv"
           return "string"
         end
@@ -2831,6 +2843,12 @@ class Compiler
     if t == "sym_str_hash"
       return 1
     end
+    if t == "str_poly_hash"
+      return 1
+    end
+    if t == "sym_poly_hash"
+      return 1
+    end
     if t == "sym_array"
       return 1
     end
@@ -2908,6 +2926,9 @@ class Compiler
       return 1
     end
     if bt == "sym_int_hash" || bt == "sym_str_hash" || bt == "sym_array"
+      return 1
+    end
+    if bt == "str_poly_hash" || bt == "sym_poly_hash"
       return 1
     end
     if bt == "stringio" || bt == "lambda" || bt == "poly_array"
@@ -2997,6 +3018,12 @@ class Compiler
     end
     if t == "sym_str_hash"
       return "sp_SymStrHash *"
+    end
+    if t == "str_poly_hash"
+      return "sp_StrPolyHash *"
+    end
+    if t == "sym_poly_hash"
+      return "sp_SymPolyHash *"
     end
     if t == "sym_array"
       # sym_array is an IntArray internally (sp_sym = mrb_int)
@@ -10454,6 +10481,20 @@ class Compiler
                       else
                         types.push("string")
                       end
+                    elsif recv_type == "sym_poly_hash"
+                      if bk == 0
+                        types.push("symbol")
+                      else
+                        types.push("poly")
+                        @needs_rb_value = 1
+                      end
+                    elsif recv_type == "str_poly_hash"
+                      if bk == 0
+                        types.push("string")
+                      else
+                        types.push("poly")
+                        @needs_rb_value = 1
+                      end
                     elsif recv_type == "poly_array"
                       types.push("poly")
                       @needs_rb_value = 1
@@ -14253,6 +14294,43 @@ class Compiler
         end
       end
     end
+    if recv_type == "sym_poly_hash"
+      if mname == "[]"
+        return "sp_SymPolyHash_get((sp_SymPolyHash *)(" + rc + "), " + compile_arg0(nid) + ")"
+      end
+      if mname == "has_key?" || mname == "key?" || mname == "include?" || mname == "member?"
+        return "sp_SymPolyHash_has_key((sp_SymPolyHash *)(" + rc + "), " + compile_arg0(nid) + ")"
+      end
+      if mname == "length" || mname == "size" || (mname == "count" && @nd_block[nid] < 0 && @nd_arguments[nid] < 0)
+        return "sp_SymPolyHash_length((sp_SymPolyHash *)(" + rc + "))"
+      end
+      if mname == "empty?"
+        return "(sp_SymPolyHash_length(" + rc + ") == 0)"
+      end
+      if mname == "any?" && @nd_block[nid] < 0
+        return "(sp_SymPolyHash_length(" + rc + ") > 0)"
+      end
+    end
+    if recv_type == "str_poly_hash"
+      if mname == "[]"
+        return "sp_StrPolyHash_get(" + rc + ", " + compile_str_arg0(nid) + ")"
+      end
+      if mname == "has_key?" || mname == "key?" || mname == "include?" || mname == "member?"
+        return "sp_StrPolyHash_has_key(" + rc + ", " + compile_str_arg0(nid) + ")"
+      end
+      if mname == "length" || mname == "size" || (mname == "count" && @nd_block[nid] < 0 && @nd_arguments[nid] < 0)
+        return "sp_StrPolyHash_length(" + rc + ")"
+      end
+      if mname == "empty?"
+        return "(sp_StrPolyHash_length(" + rc + ") == 0)"
+      end
+      if mname == "any?" && @nd_block[nid] < 0
+        return "(sp_StrPolyHash_length(" + rc + ") > 0)"
+      end
+      if mname == "keys"
+        return "sp_StrPolyHash_keys(" + rc + ")"
+      end
+    end
     if recv_type == "str_int_hash"
       if mname == "[]"
         return "sp_StrIntHash_get(" + rc + ", " + compile_str_arg0(nid) + ")"
@@ -15654,6 +15732,30 @@ class Compiler
       elems.each { |el|
         if @nd_type[el] == "AssocNode"
           emit("  sp_SymStrHash_set(" + tmp + ", " + compile_expr(@nd_key[el]) + ", " + compile_expr(@nd_expression[el]) + ");")
+        end
+      }
+      return tmp
+    end
+    if ht == "sym_poly_hash"
+      @needs_sym_poly_hash = 1
+      @needs_rb_value = 1
+      tmp = new_temp
+      emit("  sp_SymPolyHash *" + tmp + " = sp_SymPolyHash_new();")
+      elems.each { |el|
+        if @nd_type[el] == "AssocNode"
+          emit("  sp_SymPolyHash_set(" + tmp + ", " + compile_expr(@nd_key[el]) + ", " + box_expr_to_poly(@nd_expression[el]) + ");")
+        end
+      }
+      return tmp
+    end
+    if ht == "str_poly_hash"
+      @needs_str_poly_hash = 1
+      @needs_rb_value = 1
+      tmp = new_temp
+      emit("  sp_StrPolyHash *" + tmp + " = sp_StrPolyHash_new();")
+      elems.each { |el|
+        if @nd_type[el] == "AssocNode"
+          emit("  sp_StrPolyHash_set(" + tmp + ", " + compile_expr_as_string(@nd_key[el]) + ", " + box_expr_to_poly(@nd_expression[el]) + ");")
         end
       }
       return tmp
@@ -18534,6 +18636,23 @@ class Compiler
       emit("  sp_SymStrHash_set(" + rc + ", " + idx + ", " + val + ");")
       return
     end
+    if rt == "sym_poly_hash"
+      boxed = val
+      if arg_ids.length >= 2
+        boxed = box_expr_to_poly(arg_ids[1])
+      end
+      emit("  sp_SymPolyHash_set(" + rc + ", " + idx + ", " + boxed + ");")
+      return
+    end
+    if rt == "str_poly_hash"
+      idx_s = compile_expr_as_string(arg_ids[0])
+      boxed = val
+      if arg_ids.length >= 2
+        boxed = box_expr_to_poly(arg_ids[1])
+      end
+      emit("  sp_StrPolyHash_set(" + rc + ", " + idx_s + ", " + boxed + ");")
+      return
+    end
     if rt == "int_array"
       # Check if value is an object pointer - needs cast
       vt = "int"
@@ -19001,6 +19120,30 @@ class Compiler
       emit("    lv_" + bp1 + " = " + rc + "->order[" + tmp + "];")
       if bp2 != ""
         emit("    lv_" + bp2 + " = sp_SymStrHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
+      end
+      @indent = @indent + 1
+      compile_stmts_body(@nd_body[@nd_block[nid]])
+      @indent = @indent - 1
+      emit("  }")
+    end
+    if rt == "sym_poly_hash"
+      tmp = new_temp
+      emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < " + rc + "->len; " + tmp + "++) {")
+      emit("    lv_" + bp1 + " = " + rc + "->order[" + tmp + "];")
+      if bp2 != ""
+        emit("    lv_" + bp2 + " = sp_SymPolyHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
+      end
+      @indent = @indent + 1
+      compile_stmts_body(@nd_body[@nd_block[nid]])
+      @indent = @indent - 1
+      emit("  }")
+    end
+    if rt == "str_poly_hash"
+      tmp = new_temp
+      emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < " + rc + "->len; " + tmp + "++) {")
+      emit("    lv_" + bp1 + " = " + rc + "->order[" + tmp + "];")
+      if bp2 != ""
+        emit("    lv_" + bp2 + " = sp_StrPolyHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
       end
       @indent = @indent + 1
       compile_stmts_body(@nd_body[@nd_block[nid]])
