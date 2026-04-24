@@ -1521,6 +1521,16 @@ class Compiler
       end
     end
 
+    # User-defined top-level method (bare call): take precedence over
+    # name-based builtin inference so `def minmax(a,b); ... end; minmax(1,2)`
+    # binds to the user def instead of Array#minmax's tuple return.
+    if recv < 0
+      mi_user = find_method_idx(mname)
+      if mi_user >= 0
+        return @meth_return_types[mi_user]
+      end
+    end
+
     # Method name-based type inference
     r = infer_method_name_type(nid, mname, recv)
     if r != ""
@@ -3135,6 +3145,33 @@ class Compiler
         @tuple_types.push(t)
       end
     end
+  end
+
+  # Build "tuple:T0,T1,..." from a list of element node ids and register it.
+  def tuple_type_from_elems(elems)
+    parts = "".split(",")
+    k = 0
+    while k < elems.length
+      parts.push(infer_type(elems[k]))
+      k = k + 1
+    end
+    tt = "tuple:" + parts.join(",")
+    register_tuple_type(tt)
+    tt
+  end
+
+  # Inferred C type of the i-th lvalue in `a, b, c = rhs`.  Tuple RHS gives
+  # per-position types; everything else falls back to "int" (matching the
+  # legacy default — only the homogeneous int_array case is in wide use).
+  def multi_write_target_type(val_id, ti)
+    if val_id < 0
+      return "int"
+    end
+    rt = infer_type(val_id)
+    if is_tuple_type(rt) == 1
+      return tuple_elem_type_at(rt, ti)
+    end
+    "int"
   end
 
   def type_is_pointer(t)
@@ -6635,6 +6672,12 @@ class Compiler
       args_id = @nd_arguments[nid]
       if args_id >= 0
         arg_ids = get_args(args_id)
+        if arg_ids.length > 1
+          # `return a, b` materializes as a fixed-arity tuple. Heterogeneous
+          # element types are preserved unboxed (no poly_array fallback).
+          types.push(tuple_type_from_elems(arg_ids))
+          return
+        end
         if arg_ids.length > 0
           types.push(infer_type(arg_ids[0]))
           return
@@ -7754,16 +7797,19 @@ class Compiler
     end
     if @nd_type[nid] == "MultiWriteNode"
       targets = parse_id_list(@nd_targets[nid])
+      val_id = @nd_expression[nid]
+      ti = 0
       targets.each { |tid|
         if @nd_type[tid] == "LocalVariableTargetNode"
           lname = @nd_name[tid]
           if not_in(lname, names) == 1
             if not_in(lname, params) == 1
               names.push(lname)
-              types.push("int")
+              types.push(multi_write_target_type(val_id, ti))
             end
           end
         end
+        ti = ti + 1
       }
     end
     # Recurse
@@ -10994,18 +11040,21 @@ class Compiler
     end
     if @nd_type[nid] == "MultiWriteNode"
       targets = parse_id_list(@nd_targets[nid])
+      val_id2 = @nd_expression[nid]
+      ti2 = 0
       targets.each { |tid|
         if @nd_type[tid] == "LocalVariableTargetNode"
           lname = @nd_name[tid]
           if not_in(lname, names) == 1
             if not_in(lname, params) == 1
               names.push(lname)
-              types.push("int")
+              types.push(multi_write_target_type(val_id2, ti2))
               @scan_literal_flags.push("")
               @scan_empty_flags.push("")
             end
           end
         end
+        ti2 = ti2 + 1
       }
       if @nd_expression[nid] >= 0
         scan_locals(@nd_expression[nid], names, types, params)
@@ -17977,6 +18026,21 @@ class Compiler
         end
         k = k + 1
       end
+    elsif is_tuple_type(infer_type(val_id)) == 1
+      # RHS is a tuple-returning call — destructure via field access.
+      val_t = infer_type(val_id)
+      @needs_gc = 1
+      tmp = new_temp
+      emit("  " + c_type(val_t) + " " + tmp + " = " + compile_expr(val_id) + ";")
+      emit("  SP_GC_ROOT(" + tmp + ");")
+      k = 0
+      while k < targets.length
+        tid = targets[k]
+        if @nd_type[tid] == "LocalVariableTargetNode"
+          emit("  " + fiber_var_ref(@nd_name[tid]) + " = " + tmp + "->_" + k.to_s + ";")
+        end
+        k = k + 1
+      end
     else
       # RHS is a function call returning int_array
       @needs_int_array = 1
@@ -18536,6 +18600,24 @@ class Compiler
     args_id = @nd_arguments[nid]
     if args_id >= 0
       arg_ids = get_args(args_id)
+      if arg_ids.length > 1
+        # `return a, b [, c]` — materialize as a fixed-arity tuple struct.
+        @needs_gc = 1
+        tt = tuple_type_from_elems(arg_ids)
+        tname = tuple_c_name(tt)
+        arr_tmp = new_temp
+        emit("  " + tname + " *" + arr_tmp + " = (" + tname + " *)sp_gc_alloc(sizeof(" + tname + "), NULL, " + tuple_scan_name(tt) + ");")
+        k = 0
+        while k < arg_ids.length
+          emit("  " + arr_tmp + "->_" + k.to_s + " = " + compile_expr(arg_ids[k]) + ";")
+          k = k + 1
+        end
+        if @in_gc_scope == 1
+          emit("  SP_GC_RESTORE();")
+        end
+        emit("  return " + arr_tmp + ";")
+        return
+      end
       if arg_ids.length > 0
         rt = infer_type(arg_ids[0])
         # return nil in a nullable pointer method → return NULL
