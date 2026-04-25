@@ -9038,14 +9038,62 @@ class Compiler
     if @cls_names.length > 0
       emit_raw("")
     end
-    # Struct definitions
+    # Struct definitions, ordered so a class with a value-type ivar of
+    # type X is emitted after X (C requires the embedded struct's full
+    # definition to be visible). Pointer-typed ivars only need the
+    # forward typedef above, so they impose no ordering constraint.
+    @struct_emitted = []
     i = 0
     while i < @cls_names.length
-      emit_raw("struct sp_" + @cls_names[i] + "_s {")
-      emit_class_fields(i)
-      emit_raw("};")
-      emit_raw("")
+      @struct_emitted.push(0)
       i = i + 1
+    end
+    i = 0
+    while i < @cls_names.length
+      emit_class_struct_with_deps(i)
+      i = i + 1
+    end
+  end
+
+  def emit_class_struct_with_deps(ci)
+    if @struct_emitted[ci] == 1
+      return
+    end
+    @struct_emitted[ci] = 1
+    # Walk this class and all its ancestors (whose ivars are flattened
+    # into this struct by emit_parent_fields) and emit any value-type
+    # field's class struct first.
+    ai = ci
+    while ai >= 0
+      emit_value_type_field_deps(ci, ai)
+      if @cls_parents[ai] != ""
+        ai = find_class_idx(@cls_parents[ai])
+      else
+        ai = -1
+      end
+    end
+    emit_raw("struct sp_" + @cls_names[ci] + "_s {")
+    emit_class_fields(ci)
+    emit_raw("};")
+    emit_raw("")
+  end
+
+  def emit_value_type_field_deps(orig_ci, ai)
+    types = @cls_ivar_types[ai].split(";")
+    j = 0
+    while j < types.length
+      emit_value_type_field_dep(orig_ci, types[j])
+      j = j + 1
+    end
+  end
+
+  def emit_value_type_field_dep(orig_ci, t)
+    if is_value_type_obj(t) == 1
+      cname = t[4, t.length - 4]
+      di = find_class_idx(cname)
+      if di >= 0 && di != orig_ci
+        emit_class_struct_with_deps(di)
+      end
     end
   end
 
