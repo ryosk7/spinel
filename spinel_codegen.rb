@@ -18705,10 +18705,49 @@ class Compiler
     end
     pop_scope
     @out_lines = save_out
+    # Detect free variables that reference outer-scope locals (captures).
+    # Until proc closure support lands (Phase 2), surface this loudly:
+    # silent file-scope hoist would either drop the body or fail to compile.
+    free_vars = "".split(",")
+    if bbody >= 0
+      proc_params = "".split(",")
+      proc_params.push(bp)
+      proc_locals = "".split(",")
+      scan_lambda_free_vars(bbody, proc_params, proc_locals, free_vars)
+    end
+    captures = "".split(",")
+    fk = 0
+    while fk < free_vars.length
+      fv = free_vars[fk]
+      if find_var_type(fv) != ""
+        captures.push(fv)
+      end
+      fk = fk + 1
+    end
+    if captures.length > 0
+      cap_list = captures.join(", ")
+      STDERR.puts("spinel: proc body captures outer local(s) [" + cap_list + "] which is not yet implemented; use lambda { ... } / -> { ... } for closures (proc: " + fname + ")")
+      @lambda_funcs << "/* proc captures outer locals (not yet supported): "
+      @lambda_funcs << cap_list
+      @lambda_funcs << " */\n"
+      @lambda_funcs << "static mrb_int "
+      @lambda_funcs << fname
+      @lambda_funcs << "(mrb_int lv_"
+      @lambda_funcs << bp
+      @lambda_funcs << ") {\n"
+      @lambda_funcs << "  fprintf(stderr, \"spinel: proc with captured variables ["
+      @lambda_funcs << cap_list
+      @lambda_funcs << "] is not implemented; use lambda for closures"
+      @lambda_funcs << bsl_n
+      @lambda_funcs << "\");\n"
+      @lambda_funcs << "  abort();\n"
+      @lambda_funcs << "  return 0;\n"
+      @lambda_funcs << "}\n"
+      return "sp_proc_new(" + fname + ")"
+    end
     # Hoist the proc body to file scope. Previously this was emitted as a
     # GCC nested-function inside a statement-expression, which Apple clang
-    # does not implement. File-scope works for non-capturing procs (the
-    # only kind compile_proc_literal currently produces).
+    # does not implement. File-scope works for non-capturing procs.
     @lambda_funcs << "static mrb_int "
     @lambda_funcs << fname
     @lambda_funcs << "(mrb_int lv_"
