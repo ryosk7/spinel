@@ -385,6 +385,9 @@ static int flatten(pm_node_t *node) {
     N("RangeNode");
     R("left", n->left);
     R("right", n->right);
+    /* PM_RANGE_FLAGS_EXCLUDE_END = 4. Codegen reads bit 2 to decide
+       whether `..` (inclusive) or `...` (exclusive). */
+    I("flags", n->base.flags);
     break;
   }
   case PM_IF_NODE: {

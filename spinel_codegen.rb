@@ -3279,6 +3279,14 @@ class Compiler
     c_default_val(t)
   end
 
+  # PM_RANGE_FLAGS_EXCLUDE_END = 4: bit 2 set means `...` (exclusive).
+  def range_excl_end(rid)
+    if (@nd_flags[rid] & 4) != 0
+      return 1
+    end
+    return 0
+  end
+
   def sanitize_name(name)
     if name == "<=>"
       return "_cmp"
@@ -13764,10 +13772,11 @@ class Compiler
         a = get_args(args_id)
         if a.length >= 1
           if @nd_type[a[0]] == "RangeNode"
-            # s[1..3]
+            # s[1..3] inclusive, s[1...3] exclusive
             left = compile_expr(@nd_left[a[0]])
             right = compile_expr(@nd_right[a[0]])
-            return fn + "(" + lprefix + ", " + left + ", " + right + " - " + left + " + 1)"
+            adj = range_excl_end(a[0]) == 1 ? "" : " + 1"
+            return fn + "(" + lprefix + ", " + left + ", " + right + " - " + left + adj + ")"
           end
           if a.length >= 2
             # s[0, 2]
@@ -13911,6 +13920,31 @@ class Compiler
     if mname == "to_a"
       @needs_int_array = 1
       @needs_gc = 1
+      # Honour `...` exclusive Range when the receiver is a literal
+      # RangeNode (or wrapped in parens). For non-literal Range values
+      # held in sp_Range structs, exclude_end is not tracked at runtime
+      # and the inclusive form is used.
+      recv = @nd_receiver[nid]
+      range_nid = -1
+      if recv >= 0 && @nd_type[recv] == "RangeNode"
+        range_nid = recv
+      end
+      if recv >= 0 && @nd_type[recv] == "ParenthesesNode"
+        pb = @nd_body[recv]
+        if pb >= 0
+          ps = get_stmts(pb)
+          if ps.length > 0 && @nd_type[ps.first] == "RangeNode"
+            range_nid = ps.first
+          end
+        end
+      end
+      if range_nid >= 0
+        rright = compile_expr(@nd_right[range_nid])
+        if range_excl_end(range_nid) == 1
+          rright = "(" + rright + ") - 1"
+        end
+        return "sp_IntArray_from_range(" + compile_expr(@nd_left[range_nid]) + ", " + rright + ")"
+      end
       return "sp_IntArray_from_range(" + rc + ".first, " + rc + ".last)"
     end
     if mname == "length"
@@ -14441,7 +14475,8 @@ class Compiler
           if a.length >= 1 && @nd_type[a[0]] == "RangeNode"
             left = compile_expr(@nd_left[a[0]])
             right = compile_expr(@nd_right[a[0]])
-            return "sp_IntArray_slice(" + rc + ", " + left + ", " + right + " - " + left + " + 1)"
+            adj = range_excl_end(a[0]) == 1 ? "" : " + 1"
+            return "sp_IntArray_slice(" + rc + ", " + left + ", " + right + " - " + left + adj + ")"
           end
           if a.length >= 2
             return "sp_IntArray_slice(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
@@ -14634,7 +14669,8 @@ class Compiler
           if a.length >= 1 && @nd_type[a[0]] == "RangeNode"
             left = compile_expr(@nd_left[a[0]])
             right = compile_expr(@nd_right[a[0]])
-            return "sp_FloatArray_slice(" + rc + ", " + left + ", " + right + " - " + left + " + 1)"
+            adj = range_excl_end(a[0]) == 1 ? "" : " + 1"
+            return "sp_FloatArray_slice(" + rc + ", " + left + ", " + right + " - " + left + adj + ")"
           end
           if a.length >= 2
             return "sp_FloatArray_slice(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
@@ -14710,7 +14746,8 @@ class Compiler
           if a.length >= 1 && @nd_type[a[0]] == "RangeNode"
             left = compile_expr(@nd_left[a[0]])
             right = compile_expr(@nd_right[a[0]])
-            return "sp_StrArray_slice(" + rc + ", " + left + ", " + right + " - " + left + " + 1)"
+            adj = range_excl_end(a[0]) == 1 ? "" : " + 1"
+            return "sp_StrArray_slice(" + rc + ", " + left + ", " + right + " - " + left + adj + ")"
           end
           if a.length >= 2
             return "sp_StrArray_slice(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
@@ -15360,7 +15397,12 @@ class Compiler
     if range_nid >= 0
       @needs_int_array = 1
       @needs_gc = 1
-      return "sp_IntArray_from_range(" + compile_expr(@nd_left[range_nid]) + ", " + compile_expr(@nd_right[range_nid]) + ")"
+      right_expr = compile_expr(@nd_right[range_nid])
+      # sp_IntArray_from_range is inclusive; for `1...3` shave the upper end.
+      if range_excl_end(range_nid) == 1
+        right_expr = "(" + right_expr + ") - 1"
+      end
+      return "sp_IntArray_from_range(" + compile_expr(@nd_left[range_nid]) + ", " + right_expr + ")"
     end
     ""
   end
@@ -17106,7 +17148,8 @@ class Compiler
       if @nd_type[coll] == "RangeNode"
         left = compile_expr(@nd_left[coll])
         right = compile_expr(@nd_right[coll])
-        emit("  for (lv_" + vname + " = " + left + "; lv_" + vname + " <= " + right + "; lv_" + vname + "++) {")
+        cmp = range_excl_end(coll) == 1 ? "<" : "<="
+        emit("  for (lv_" + vname + " = " + left + "; lv_" + vname + " " + cmp + " " + right + "; lv_" + vname + "++) {")
         @indent = @indent + 1
         compile_stmts_body(@nd_body[nid])
         @indent = @indent - 1
@@ -17214,7 +17257,8 @@ class Compiler
       if @nd_type[cid] == "RangeNode"
         left = compile_expr(@nd_left[cid])
         right = compile_expr(@nd_right[cid])
-        result = result + "(" + tmp + " >= " + left + " && " + tmp + " <= " + right + ")"
+        cmp = range_excl_end(cid) == 1 ? "<" : "<="
+        result = result + "(" + tmp + " >= " + left + " && " + tmp + " " + cmp + " " + right + ")"
       else
         if pred_type == "string"
           result = result + "strcmp(" + tmp + ", " + compile_expr(cid) + ") == 0"
