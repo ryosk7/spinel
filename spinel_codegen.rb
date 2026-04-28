@@ -8523,6 +8523,9 @@ class Compiler
     emit_raw("static inline void sp_PtrArray_set(sp_PtrArray*a,mrb_int i,void*v){if(i<0)i+=a->len;a->data[i]=v;}")
     emit_raw("static inline mrb_int sp_PtrArray_length(sp_PtrArray*a){return a->len;}")
     emit_raw("static inline mrb_bool sp_PtrArray_empty(sp_PtrArray*a){return a->len==0;}")
+    emit_raw("static sp_PtrArray*sp_PtrArray_dup(sp_PtrArray*a){sp_PtrArray*b=sp_PtrArray_new_scan(a->scan_elem);for(mrb_int i=0;i<a->len;i++)sp_PtrArray_push(b,a->data[i]);return b;}")
+    emit_raw("static void sp_PtrArray_shuffle_bang(sp_PtrArray*a){for(mrb_int i=a->len-1;i>0;i--){mrb_int j=(mrb_int)(rand()%(i+1));void*t=a->data[i];a->data[i]=a->data[j];a->data[j]=t;}}")
+    emit_raw("static sp_PtrArray*sp_PtrArray_shuffle(sp_PtrArray*a){sp_PtrArray*b=sp_PtrArray_dup(a);sp_PtrArray_shuffle_bang(b);return b;}")
     emit_raw("")
   end
 
@@ -15152,12 +15155,12 @@ class Compiler
       pfx = array_c_prefix(recv_type)
       return "sp_" + pfx + "_get(" + rc + ", rand() % sp_" + pfx + "_length(" + rc + "))"
     end
-    if mname == "shuffle" && is_array_type(recv_type) == 1
+    if mname == "shuffle" && (is_array_type(recv_type) == 1 || is_ptr_array_type(recv_type) == 1)
       @needs_rand = 1
       pfx = array_c_prefix(recv_type)
       return "sp_" + pfx + "_shuffle(" + rc + ")"
     end
-    if mname == "shuffle!" && is_array_type(recv_type) == 1
+    if mname == "shuffle!" && (is_array_type(recv_type) == 1 || is_ptr_array_type(recv_type) == 1)
       @needs_rand = 1
       pfx = array_c_prefix(recv_type)
       emit("  sp_" + pfx + "_shuffle_bang(" + rc + ");")
