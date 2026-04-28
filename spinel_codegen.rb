@@ -8958,12 +8958,19 @@ class Compiler
         ch = pat[pi]
         if ch == 92.chr
           cpat = cpat + 92.chr + 92.chr
+        elsif ch == 34.chr
+          cpat = cpat + 92.chr + 34.chr
+        elsif ch == 10.chr
+          # Embedded newlines / tabs / CRs in /x patterns must be
+          # encoded as escape sequences; emitting them raw produces an
+          # unterminated C string literal.
+          cpat = cpat + 92.chr + "n"
+        elsif ch == 13.chr
+          cpat = cpat + 92.chr + "r"
+        elsif ch == 9.chr
+          cpat = cpat + 92.chr + "t"
         else
-          if ch == 34.chr
-            cpat = cpat + 92.chr + 34.chr
-          else
-            cpat = cpat + ch
-          end
+          cpat = cpat + ch
         end
         pi = pi + 1
       end
